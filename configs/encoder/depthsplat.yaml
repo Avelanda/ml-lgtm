@@ -1,0 +1,27 @@
+name: depthsplat
+
+gaussian:
+  gaussian_scale_min: 1e-10
+  gaussian_scale_max: 3.0
+  sh_degree: 2
+
+downscale_factor: 4
+shim_patch_size: 4
+
+local_mv_match: 2
+
+monodepth_vit_type: vits
+
+supervise_intermediate_depth: true
+return_depth: true
+
+num_scales: 1
+upsample_factor: 4
+lowest_feature_resolution: 4
+depth_unet_channels: 128
+grid_sample_disable_cudnn: false
+
+init_sh_input_img: true
+gaussian_regressor_channels: 64
+
+train_depth_only: false

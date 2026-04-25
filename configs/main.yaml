@@ -1,0 +1,87 @@
+defaults:
+  - _self_
+
+rasterizer:
+  name: gsplat
+  background_color: [0.0, 0.0, 0.0]
+  make_scale_invariant: true
+  backend: gsplat_3dgs
+
+loss:
+  mse:
+    weight: 1.0
+  lpips:
+    weight: 0.05
+    apply_after_step: 0
+    lpips_loss_max_dim: 512
+
+wandb:
+  project: lgtm
+  name: placeholder
+  mode: online
+
+mode: train # {train, test}
+
+data_loader:
+  train:
+    num_workers: 12
+    persistent_workers: true
+    batch_size: 4
+    seed: 1234
+  test:
+    num_workers: 12
+    persistent_workers: false
+    batch_size: 1
+    seed: 2345
+  val:
+    num_workers: 1
+    persistent_workers: true
+    batch_size: 1
+    seed: 3456
+optimizer:
+  lr: 1.5e-4
+  warm_up_steps: 125
+  backbone_lr_mult: null
+  non_head_lr_mult: null
+  non_2dgs_lr_mult: null
+
+checkpointing:
+  load: null
+  every_n_train_steps: 5000
+  save_top_k: 5
+  save_weights_only: true
+  sync_to_remote_after_ckpt_save: false
+
+train:
+  print_log_every_n_steps: 10
+  enable_dry_run: false
+  disable_validation_videos: true
+  validation_lpips_metric_max_dim: 512
+
+test:
+  enable_pose_opt: false
+  compute_scores: true
+  lpips_metric_max_dim: 1024
+
+pose_opt:
+  num_steps: 100
+  learning_rate: 0.005
+  backend_override: null
+  print_steps: false
+  save_losses: false
+  enabled_losses: [mse, lpips]
+
+seed: 111123
+
+sync_to_remote_on_finish: false
+
+trainer:
+  max_steps: -1
+  val_check_interval: 500
+  gradient_clip_val: 0.5
+  num_nodes: 1
+  log_every_n_steps: 50
+
+hydra:
+  run:
+    dir: outputs/${exp_name_resolver:}

@@ -1,0 +1,94 @@
+# @package _global_
+
+defaults:
+  - /encoder: flash3d
+  - /dataset@dataset.dl3dv: dl3dv
+
+wandb:
+  name: automatic
+  tags: [dl3dv, 2304x4096, flash3d, 2dgs]
+
+encoder:
+  gaussian:
+    sh_degree: 1
+    gaussian_scale_min: 0.5
+    gaussian_scale_max: 15.0
+  dataset:
+    height: 288
+    width: 512
+    pad_border_aug: 0
+  gaussians_per_pixel: 1
+  scale_lambda: 0.1
+  depth:
+    pretrained_checkpoint_path: pretrained/unidepth-v1-vitl14.bin
+rasterizer:
+  make_scale_invariant: true
+  backend: gsplat_2dgs
+
+loss:
+  gauss_scale:
+    weight: 0.001
+    thresh: 2.0
+  gauss_offset:
+    weight: 0.01
+    thresh: 1.0
+  flash3d_ssim:
+    weight: 0.85
+  mae:
+    weight: 1.0
+  lpips:
+    weight: 0.05
+    lpips_loss_max_dim: 512
+    enable_eager_grads: true
+  mse:
+    weight: 1e-8
+
+pose_opt:
+  enabled_losses: [mae]
+
+dataset:
+  dl3dv:
+    roots: [data/dl3dv]
+    skip_bad_shape: true
+    input_image_shape: [288, 512]
+    original_image_shape: [2160, 3840]
+    view_sampler:
+      warm_up_steps: 10000
+      sort_view_indices: false
+    include_context_view: true
+    view_sampler_on_test:
+      name: evaluation
+      index_path: assets/dl3dv_start_0_distance_10_ctx_2v_tgt_4v.json
+      num_context_views: 2
+      sort_view_indices: false
+    near: 0.01
+    far: 100.0
+
+optimizer:
+  lr: 1e-4
+  warm_up_steps: 125
+  backbone_lr_mult: 1.0
+  non_head_lr_mult: null
+  non_2dgs_lr_mult: null
+
+data_loader:
+  train:
+    batch_size: 2
+
+trainer:
+  max_steps: 20000
+  val_check_interval: 500
+
+checkpointing:
+  every_n_train_steps: 10000
+  test_ckpt_path: checkpoints/epoch_0-step_20000.ckpt
+
+train:
+  disable_validation_videos: true
+  validation_lpips_metric_max_dim: 512
+  train_target_image_shape: [2304, 4096]
+
+test:
+  enable_pose_opt: true
+  lpips_metric_max_dim: 1024
+  test_target_image_shape: [2304, 4096]

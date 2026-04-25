@@ -1,0 +1,21 @@
+name: noposplat
+
+backbone:
+  name: croco
+  model: ViTLarge_BaseDecoder
+  patch_embed_cls: PatchEmbedDust3R
+  asymmetry_decoder: true
+  intrinsics_embed_loc: encoder
+  intrinsics_embed_degree: 4
+  intrinsics_embed_type: token
+
+opacity_mapping:
+  initial: 0.0
+  final: 0.0
+  warm_up: 1
+
+gaussian:
+  gaussian_scale_max: 0.3
+  sh_degree: 1
+
+pretrained_checkpoint_path: ""

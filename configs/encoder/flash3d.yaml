@@ -1,0 +1,45 @@
+depth:
+  version: v1
+  backbone: vitl14
+  pretrained_checkpoint_path: null
+
+backbone:
+  name: resnet
+  num_layers: 50
+  num_ch_dec: [32, 32, 64, 128, 256]
+  resnet_bn_order: pre_bn
+  weights_init: pretrained
+  upsample_mode: nearest
+  depth_cond: true
+
+dataset:
+  height: 256
+  width: 384
+  pad_border_aug: 32
+
+name: unidepth
+scales: [0]
+
+min_depth: 0.1
+max_depth: 20
+
+gaussians_per_pixel: 1
+gaussian_rendering: false
+max_sh_degree: 1
+scaled_offset: false
+one_gauss_decoder: false
+predict_offset: true
+shift_rays_half_pixel: forward
+
+depth_type: depth_inc
+depth_scale: 0.1
+xyz_scale: 0.2
+opacity_scale: 1.0
+scale_scale: 1e-1
+sh_scale: 1.0
+
+scale_lambda: 0.01
+depth_bias: -0.1
+xyz_bias: 0.0
+opacity_bias: 0.0
+scale_bias: 0.02

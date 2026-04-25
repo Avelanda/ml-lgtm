@@ -1,0 +1,73 @@
+# @package _global_
+
+defaults:
+  - /encoder: noposplat
+  - /dataset@dataset.dl3dv: dl3dv
+
+wandb:
+  name: automatic
+  tags: [dl3dv, 288x512, 2304x4096]
+
+encoder:
+  gs_params_head_type: dpt_gs
+  intrinsics_embed_loc: encoder
+  intrinsics_embed_type: token
+  pretrained_checkpoint_path: outputs/dl3dv_noposplat_2dgs_288x512_2304x4096/checkpoints/epoch_0-step_20000.ckpt
+  pretrained_checkpoint_ignored_prefixes: []
+  gaussian:
+    sh_degree: 1
+
+    texture_enabled: true
+    texture_size: 8
+    texture_project_enabled: false
+    texture_alpha_mode: GAUSSIAN
+    texture_color_sigma: 1.0
+rasterizer:
+  make_scale_invariant: true
+  backend: gsplat_lgtm
+
+dataset:
+  dl3dv:
+    roots: [data/dl3dv]
+    skip_bad_shape: true
+    input_image_shape: [2304, 4096]
+    original_image_shape: [2160, 3840]
+    view_sampler:
+      warm_up_steps: 5000
+      min_distance_between_context_views: 8
+      max_distance_between_context_views: 16
+    view_sampler_on_test:
+      index_path: assets/dl3dv_start_0_distance_10_ctx_2v_tgt_4v.json
+      num_context_views: 2
+
+optimizer:
+  lr: 2e-5
+  warm_up_steps: 125
+  backbone_lr_mult: null
+  non_head_lr_mult: null
+  non_2dgs_lr_mult: 0.1
+
+data_loader:
+  train:
+    batch_size: 2
+
+trainer:
+  max_steps: 10000
+  val_check_interval: 500
+
+checkpointing:
+  every_n_train_steps: 5000
+  test_ckpt_path: checkpoints/epoch_0-step_10000.ckpt
+
+train:
+  disable_validation_videos: true
+  validation_lpips_metric_max_dim: 512
+
+test:
+  enable_pose_opt: true
+  lpips_metric_max_dim: 1024
+
+loss:
+  lpips:
+    lpips_loss_max_dim: 512
+    enable_eager_grads: true

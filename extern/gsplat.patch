@@ -1,0 +1,3262 @@
+diff --git a/.gitignore b/.gitignore
+index 8ccecea..20a539f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,6 @@
+ .clangd
+ compile_commands.json
++renders/
+ 
+ # Visual Studio Code configs.
+ .vscode/
+@@ -124,4 +125,4 @@ compile_commands.json
+ data
+ results
+ 
+-!examples/benchmarks/compression/results/
+\ No newline at end of file
++!examples/benchmarks/compression/results/
+diff --git a/gsplat/cuda/_torch_impl_2dgs.py b/gsplat/cuda/_torch_impl_2dgs.py
+index a0ca45e..9c84ecf 100644
+--- a/gsplat/cuda/_torch_impl_2dgs.py
++++ b/gsplat/cuda/_torch_impl_2dgs.py
+@@ -1,9 +1,276 @@
+ from typing import Optional, Tuple
++import math
+ 
+ import torch
+ from torch import Tensor
+ 
++from tqdm import tqdm
++
+ from gsplat.cuda._torch_impl import _quat_scale_to_matrix
++from gsplat.cuda._wrapper import TextureAlphaMode
++
++ALPHA_THRESHOLD = 1 / 255.0
++
++
++def bilinear_texture_sampler(
++    us: Tensor,  # [M] UV coordinates in x-direction (range [-1, 1])
++    vs: Tensor,  # [M] UV coordinates in y-direction (range [-1, 1])
++    textures: Tensor,  # [M, channels, texture_size, texture_size] batched textures
++    texture_size: int,
++    channels: int,
++    texture_normalize: bool = False,
++    texture_crop: bool = False,
++) -> Tensor:
++    """
++    Vectorized PyTorch implementation of bilinear texture sampling.
++    Adapted from grid_sample.py with configurable texture_normalize and texture_crop.
++
++    This version is fully vectorized for efficient batched operations.
++
++    Args:
++        us: Normalized coordinates in x-direction (range [-1, 1]). Shape [M].
++        vs: Normalized coordinates in y-direction (range [-1, 1]). Shape [M].
++        textures: Batched texture data with shape [M, channels, texture_size, texture_size].
++        texture_size: The size (width and height) of the square textures.
++        channels: Number of channels in each texture.
++        texture_normalize: If True, normalizes weights for in-bounds samples.
++        texture_crop: If True, returns zeros for any sample where any corner is out of bounds.
++
++    Returns:
++        Sampled values with shape [M, channels].
++    """
++    M = us.shape[0]
++    device = textures.device
++    dtype = textures.dtype
++
++    # Convert UV coordinates to texture coordinates
++    x = ((us + 1) / 2) * (texture_size - 1)
++    y = ((vs + 1) / 2) * (texture_size - 1)
++
++    # Get integer indices for the four corners
++    ix_nw = torch.floor(x).long()
++    iy_nw = torch.floor(y).long()
++
++    ix_ne = ix_nw + 1
++    iy_ne = iy_nw
++    ix_sw = ix_nw
++    iy_sw = iy_nw + 1
++    ix_se = ix_nw + 1
++    iy_se = iy_nw + 1
++
++    # Calculate weights for the four neighboring pixels
++    nw = (ix_se.float() - x) * (iy_se.float() - y)
++    ne = (x - ix_sw.float()) * (iy_sw.float() - y)
++    sw = (ix_ne.float() - x) * (y - iy_ne.float())
++    se = (x - ix_nw.float()) * (y - iy_nw.float())
++
++    # Check bounds for all four corners
++    def in_bounds_2d(h: Tensor, w: Tensor, H: int, W: int) -> Tensor:
++        return (h >= 0) & (h < H) & (w >= 0) & (w < W)
++
++    in_bounds_nw = in_bounds_2d(iy_nw, ix_nw, texture_size, texture_size)
++    in_bounds_ne = in_bounds_2d(iy_ne, ix_ne, texture_size, texture_size)
++    in_bounds_sw = in_bounds_2d(iy_sw, ix_sw, texture_size, texture_size)
++    in_bounds_se = in_bounds_2d(iy_se, ix_se, texture_size, texture_size)
++    all_in_bounds = in_bounds_nw & in_bounds_ne & in_bounds_sw & in_bounds_se
++
++    # Initialize result
++    result = torch.zeros(M, channels, device=device, dtype=dtype)
++
++    # Handle texture_color_crop case - return zeros for samples where any corner is out of bounds
++    if texture_crop:
++        # Only process samples where all corners are in bounds
++        valid_samples = all_in_bounds
++        if not valid_samples.any():
++            return result
++    else:
++        # Process all samples
++        valid_samples = torch.ones(M, dtype=torch.bool, device=device)
++
++    # Normalize weights if requested and only for valid samples
++    if texture_normalize:
++        # Calculate weight sum for in-bounds samples
++        weight_sum = torch.zeros_like(nw)
++        weight_sum = torch.where(
++            in_bounds_nw & valid_samples, weight_sum + nw, weight_sum
++        )
++        weight_sum = torch.where(
++            in_bounds_ne & valid_samples, weight_sum + ne, weight_sum
++        )
++        weight_sum = torch.where(
++            in_bounds_sw & valid_samples, weight_sum + sw, weight_sum
++        )
++        weight_sum = torch.where(
++            in_bounds_se & valid_samples, weight_sum + se, weight_sum
++        )
++
++        # Normalize weights where sum is positive
++        # Use a numerically stable approach with a minimum threshold
++        min_weight_sum = 1e-8
++        valid_sum = (weight_sum > min_weight_sum) & valid_samples
++
++        if valid_sum.any():
++            # Instead of directly dividing by weight_sum, use torch.where to be more explicit
++            # This helps PyTorch's autograd handle the operation more stably
++            safe_weight_sum = torch.clamp(weight_sum, min=min_weight_sum)
++
++            # Normalize weights only for valid samples with sufficient weight_sum
++            nw = torch.where(
++                valid_sum & in_bounds_nw,
++                nw / safe_weight_sum,
++                torch.where(in_bounds_nw, torch.zeros_like(nw), nw),
++            )
++            ne = torch.where(
++                valid_sum & in_bounds_ne,
++                ne / safe_weight_sum,
++                torch.where(in_bounds_ne, torch.zeros_like(ne), ne),
++            )
++            sw = torch.where(
++                valid_sum & in_bounds_sw,
++                sw / safe_weight_sum,
++                torch.where(in_bounds_sw, torch.zeros_like(sw), sw),
++            )
++            se = torch.where(
++                valid_sum & in_bounds_se,
++                se / safe_weight_sum,
++                torch.where(in_bounds_se, torch.zeros_like(se), se),
++            )
++
++    # Clamp coordinates to valid range for safe indexing
++    iy_nw_clamped = torch.clamp(iy_nw, 0, texture_size - 1)
++    ix_nw_clamped = torch.clamp(ix_nw, 0, texture_size - 1)
++    iy_ne_clamped = torch.clamp(iy_ne, 0, texture_size - 1)
++    ix_ne_clamped = torch.clamp(ix_ne, 0, texture_size - 1)
++    iy_sw_clamped = torch.clamp(iy_sw, 0, texture_size - 1)
++    ix_sw_clamped = torch.clamp(ix_sw, 0, texture_size - 1)
++    iy_se_clamped = torch.clamp(iy_se, 0, texture_size - 1)
++    ix_se_clamped = torch.clamp(ix_se, 0, texture_size - 1)
++
++    # Create batch indices for advanced indexing
++    batch_indices = torch.arange(M, device=device)
++
++    # Vectorized sampling with bounds checking
++    # NW corner
++    valid_nw = in_bounds_nw & valid_samples
++    if valid_nw.any():
++        nw_values = textures[
++            batch_indices[valid_nw], :, iy_nw_clamped[valid_nw], ix_nw_clamped[valid_nw]
++        ]  # [valid_count, channels]
++        result[valid_nw] += nw_values * nw[valid_nw].unsqueeze(1)  # Broadcasting weight
++
++    # NE corner
++    valid_ne = in_bounds_ne & valid_samples
++    if valid_ne.any():
++        ne_values = textures[
++            batch_indices[valid_ne], :, iy_ne_clamped[valid_ne], ix_ne_clamped[valid_ne]
++        ]
++        result[valid_ne] += ne_values * ne[valid_ne].unsqueeze(1)
++
++    # SW corner
++    valid_sw = in_bounds_sw & valid_samples
++    if valid_sw.any():
++        sw_values = textures[
++            batch_indices[valid_sw], :, iy_sw_clamped[valid_sw], ix_sw_clamped[valid_sw]
++        ]
++        result[valid_sw] += sw_values * sw[valid_sw].unsqueeze(1)
++
++    # SE corner
++    valid_se = in_bounds_se & valid_samples
++    if valid_se.any():
++        se_values = textures[
++            batch_indices[valid_se], :, iy_se_clamped[valid_se], ix_se_clamped[valid_se]
++        ]
++        result[valid_se] += se_values * se[valid_se].unsqueeze(1)
++
++    return result
++
++
++def bilinear_texture_sampler_unbounded(
++    us: Tensor,  # [M] UV coordinates in x-direction (range [-texture_sigma, texture_sigma])
++    vs: Tensor,  # [M] UV coordinates in y-direction (range [-texture_sigma, texture_sigma])
++    textures: Tensor,  # [M, channels, texture_size, texture_size] batched textures
++    texture_size: int,
++    channels: int,
++    texture_sigma: float = 1.0,
++) -> Tensor:
++    """
++    Vectorized PyTorch implementation of bilinear texture sampling with configurable sigma parameter.
++
++    When texture_sigma == 1.0, it's equivalent to PyTorch's grid_sample with:
++    - mode="bilinear"
++    - padding_mode="border"
++    - align_corners=False
++
++    This version implements the unbounded sampling approach that applies explicit border clamping
++    instead of in-bounds checking, and doesn't support texture_color_normalize or texture_color_crop
++    options (as these are not part of the unbounded sampling specification).
++
++    Args:
++        us: Normalized coordinates in x-direction (range [-texture_sigma, texture_sigma]). Shape [M].
++        vs: Normalized coordinates in y-direction (range [-texture_sigma, texture_sigma]). Shape [M].
++        textures: Batched texture data with shape [M, channels, texture_size, texture_size].
++        texture_size: The size (width and height) of the square textures.
++        channels: Number of channels in each texture.
++        texture_sigma: Controls the coordinate range and BBSplat span. Default 1.0.
++
++    Returns:
++        Sampled values with shape [M, channels].
++    """
++    M = us.shape[0]
++    device = textures.device
++    dtype = textures.dtype
++
++    # Convert from norm_im_coords [-sigma, sigma] to pix_coords
++    # Matches CUDA: (u + texture_sigma) / (2.0f * texture_sigma) * texture_size - 0.5f
++    x = (us + texture_sigma) / (2.0 * texture_sigma) * texture_size - 0.5
++    y = (vs + texture_sigma) / (2.0 * texture_sigma) * texture_size - 0.5
++
++    # Apply border clamping (equivalent to padding_mode="border")
++    # Matches CUDA: fmaxf(0.0f, fminf(texture_size - 1.0f, x))
++    x = torch.clamp(x, min=0.0, max=texture_size - 1.0)
++    y = torch.clamp(y, min=0.0, max=texture_size - 1.0)
++
++    # Get integer coordinates for the 4 surrounding pixels
++    ix_nw = torch.floor(x).long()
++    iy_nw = torch.floor(y).long()
++    ix_ne = torch.clamp(ix_nw + 1, max=texture_size - 1)
++    iy_ne = iy_nw
++    ix_sw = ix_nw
++    iy_sw = torch.clamp(iy_nw + 1, max=texture_size - 1)
++    ix_se = ix_ne
++    iy_se = iy_sw
++
++    # Get fractional parts for interpolation
++    f_x = x - ix_nw.float()
++    f_y = y - iy_nw.float()
++
++    # Calculate bilinear weights (matches CUDA implementation)
++    nw = (1.0 - f_x) * (1.0 - f_y)
++    ne = f_x * (1.0 - f_y)
++    sw = (1.0 - f_x) * f_y
++    se = f_x * f_y
++
++    # Initialize result
++    result = torch.zeros(M, channels, device=device, dtype=dtype)
++
++    # Create batch indices for advanced indexing
++    batch_indices = torch.arange(M, device=device)
++
++    # Vectorized sampling with bilinear interpolation
++    # All coordinates are guaranteed to be in bounds due to clamping
++    nw_values = textures[batch_indices, :, iy_nw, ix_nw]  # [M, channels]
++    result += nw_values * nw.unsqueeze(1)
++
++    ne_values = textures[batch_indices, :, iy_ne, ix_ne]  # [M, channels]
++    result += ne_values * ne.unsqueeze(1)
++
++    sw_values = textures[batch_indices, :, iy_sw, ix_sw]  # [M, channels]
++    result += sw_values * sw.unsqueeze(1)
++
++    se_values = textures[batch_indices, :, iy_se, ix_se]  # [M, channels]
++    result += se_values * se.unsqueeze(1)
++
++    return result
+ 
+ 
+ def _fully_fused_projection_2dgs(
+@@ -17,6 +284,7 @@ def _fully_fused_projection_2dgs(
+     near_plane: float = 0.01,
+     far_plane: float = 1e10,
+     eps: float = 1e-6,
++    texture_scale_multiplier: float = 1.0,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     """PyTorch implementation of `gsplat.cuda._wrapper.fully_fused_projection_2dgs()`
+ 
+@@ -59,7 +327,9 @@ def _fully_fused_projection_2dgs(
+     )  # [C, N, 2]
+ 
+     depths = means_c[..., 2]  # [C, N]
+-    radius = torch.ceil(3.33 * extents)  # (C, N, 2)
++
++    base_radius = 3.33 * texture_scale_multiplier
++    radius = torch.ceil(base_radius * extents)  # (C, N, 2)
+ 
+     valid = valid.squeeze(-1) & (depths > near_plane) & (depths < far_plane)
+     radius[~valid] = 0.0
+@@ -86,6 +356,11 @@ def accumulate_2dgs(
+     camera_ids: Tensor,  # [M]
+     image_width: int,
+     image_height: int,
++    texture_colors: Optional[Tensor] = None,  # [N, 3, texture_h, texture_w]
++    texture_alphas: Optional[Tensor] = None,  # [N, texture_h, texture_w]
++    texture_size: int = 0,  # texture_h (== texture_w)
++    texture_color_sigma: float = 1.0,  # Sigma parameter for unbounded texture sampling
++    texture_alpha_mode: TextureAlphaMode = TextureAlphaMode.TEXTURE,  # Alpha computation mode
+ ) -> Tuple[Tensor, Tensor, Tensor]:
+     """Alpha compositing for 2DGS.
+ 
+@@ -104,6 +379,9 @@ def accumulate_2dgs(
+         camera_ids: Collection of camera indices to be rasterized. A flattened list of shape [M].
+         image_width: Image width.
+         image_height: Image height.
++        texture_colors: Optional texture colors. [N, 3, texture_h, texture_w]
++        texture_alphas: Optional texture alphas. [N, texture_h, texture_w]
++        texture_size: Optional texture size. texture_h (== texture_w)
+ 
+     Returns:
+         A tuple:
+@@ -133,25 +411,111 @@ def accumulate_2dgs(
+     h_u = -M[..., 0, :3] + M[..., 2, :3] * pixel_ids_x[..., None]  # [M, 3]
+     h_v = -M[..., 1, :3] + M[..., 2, :3] * pixel_ids_y[..., None]  # [M, 3]
+     tmp = torch.cross(h_u, h_v, dim=-1)
++
+     us = tmp[..., 0] / tmp[..., 2]
+     vs = tmp[..., 1] / tmp[..., 2]
++
++    # Check if textures are enabled - only based on texture_colors
++    texture_enabled = texture_colors is not None
++    M_count = len(gaussian_ids)
++
++    # Always compute Gaussian alphas (needed for all modes except pure TEXTURE)
+     sigmas_3d = us**2 + vs**2  # [M]
+     sigmas_2d = 2 * (deltas[..., 0] ** 2 + deltas[..., 1] ** 2)
+     sigmas = 0.5 * torch.minimum(sigmas_3d, sigmas_2d)  # [M]
+-
+-    alphas = torch.clamp_max(
++    gaussian_alphas = torch.clamp_max(
+         opacities[camera_ids, gaussian_ids] * torch.exp(-sigmas), 0.999
+     )
+ 
++    # Initialize final alpha and color arrays
++    alphas = gaussian_alphas  # Default to Gaussian alphas
++    texture_sampled_colors = torch.zeros(
++        M_count, min(channels, 3), device=means2d.device
++    )
++
++    # Handle texture-based alpha computation if textures are enabled
++    if texture_enabled:
++        if texture_alpha_mode == TextureAlphaMode.TEXTURE:
++            # Pure texture alpha mode - requires texture_alphas
++            if texture_alphas is None:
++                raise ValueError(
++                    "texture_alphas must be provided for TEXTURE alpha mode"
++                )
++            if M_count > 0:
++                alpha_textures_batch = texture_alphas[gaussian_ids].unsqueeze(1)
++                # Texture alpha always uses regular bilinear sampling, never unbounded
++                sampled_alphas = bilinear_texture_sampler(
++                    us=us,
++                    vs=vs,
++                    textures=alpha_textures_batch,
++                    texture_size=texture_size,
++                    channels=1,
++                    texture_normalize=False,
++                    texture_crop=False,
++                )
++                alphas = torch.clamp_max(sampled_alphas[:, 0], 0.999)
++
++        elif texture_alpha_mode == TextureAlphaMode.MULTIPLY:
++            # Multiply texture alpha with Gaussian alpha - requires texture_alphas
++            if texture_alphas is None:
++                raise ValueError(
++                    "texture_alphas must be provided for MULTIPLY alpha mode"
++                )
++            if M_count > 0:
++                alpha_textures_batch = texture_alphas[gaussian_ids].unsqueeze(1)
++                # Texture alpha always uses regular bilinear sampling, never unbounded
++                sampled_alphas = bilinear_texture_sampler(
++                    us=us,
++                    vs=vs,
++                    textures=alpha_textures_batch,
++                    texture_size=texture_size,
++                    channels=1,
++                    texture_normalize=False,
++                    texture_crop=False,
++                )
++                texture_alphas_sampled = torch.clamp_max(sampled_alphas[:, 0], 0.999)
++                alphas = texture_alphas_sampled * gaussian_alphas
++
++        elif texture_alpha_mode == TextureAlphaMode.GAUSSIAN:
++            # In GAUSSIAN mode, texture_alphas will not be used.
++            # CUDA   : it manually allocates a zero tensor for v_texture_alphas
++            # PyTorch: here, we create some dummy computation to mimic zero gradients
++            if texture_alphas is not None and M_count > 0:
++                alphas = alphas + texture_alphas[gaussian_ids].sum() * 0.0  # noqa: F821
++
++    # Sample color textures if textures are enabled
++    if texture_enabled and M_count > 0:
++        color_textures_batch = texture_colors[gaussian_ids]
++        texture_sampled_colors = bilinear_texture_sampler_unbounded(
++            us=us,
++            vs=vs,
++            textures=color_textures_batch,
++            texture_size=texture_size,
++            channels=3,
++            texture_sigma=texture_color_sigma,
++        )
++
+     indices = camera_ids * image_height * image_width + pixel_ids
+     total_pixels = C * image_height * image_width
+ 
++    alpha_mask = alphas >= ALPHA_THRESHOLD
+     weights, trans = render_weight_from_alpha(
+-        alphas, ray_indices=indices, n_rays=total_pixels
++        alphas * alpha_mask.float(),
++        ray_indices=indices,
++        n_rays=total_pixels,
+     )
++
++    # Prepare colors for rendering - implement BBSplat color blending if texture is available
++    render_colors = colors[camera_ids, gaussian_ids]  # [M, channels]
++    if texture_enabled:
++        # BBSplat rendering equation: color = (sampled_texture_color + base_color)
++        # Note: The alpha component is already handled in the opacity computation above
++        for k in range(min(channels, 3)):
++            render_colors[:, k] = texture_sampled_colors[:, k] + render_colors[:, k]
++
+     renders = accumulate_along_rays(
+         weights,
+-        colors[camera_ids, gaussian_ids],
++        render_colors,
+         ray_indices=indices,
+         n_rays=total_pixels,
+     ).reshape(C, image_height, image_width, channels)
+@@ -181,6 +545,11 @@ def _rasterize_to_pixels_2dgs(
+     flatten_ids: Tensor,  # [n_isects]
+     backgrounds: Optional[Tensor] = None,  # [C, channels]
+     batch_per_iter: int = 100,
++    texture_colors: Optional[Tensor] = None,  # [N, 3, texture_h, texture_w]
++    texture_alphas: Optional[Tensor] = None,  # [N, texture_h, texture_w]
++    texture_size: int = 0,  # texture_h (== texture_w)
++    texture_color_sigma: float = 1.0,  # Sigma parameter for unbounded texture sampling
++    texture_alpha_mode: TextureAlphaMode = TextureAlphaMode.TEXTURE,  # Alpha computation mode
+ ):
+     """Pytorch implementation of `gsplat.cuda._wrapper.rasterize_to_pixels_2dgs()`.
+ 
+@@ -256,6 +625,11 @@ def _rasterize_to_pixels_2dgs(
+             camera_ids,
+             image_width,
+             image_height,
++            texture_colors,
++            texture_alphas,
++            texture_size,
++            texture_color_sigma=texture_color_sigma,
++            texture_alpha_mode=texture_alpha_mode,
+         )
+         render_colors = render_colors + renders_step * transmittances[..., None]
+         render_alphas = render_alphas + accs_step * transmittances[..., None]
+diff --git a/gsplat/cuda/_wrapper.py b/gsplat/cuda/_wrapper.py
+index a33602d..5109990 100644
+--- a/gsplat/cuda/_wrapper.py
++++ b/gsplat/cuda/_wrapper.py
+@@ -39,6 +39,11 @@ class RollingShutterType(Enum):
+         return _make_lazy_cuda_obj(f"ShutterType.{self.name}")
+ 
+ 
++# TextureAlphaMode is now defined as a C++ enum and bound via ext.cpp
++# Set up lazy loading
++TextureAlphaMode = _make_lazy_cuda_obj("TextureAlphaMode")
++
++
+ @dataclass
+ class UnscentedTransformParameters:
+     # Sigma point parameters (see Gustafsson and Hendeby 2012, Wan and van der Merwe 2000)
+@@ -1369,9 +1374,13 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
+         camera_model_type = ctx.camera_model_type
+         tile_size = ctx.tile_size
+ 
+-        (v_means, v_quats, v_scales, v_colors, v_opacities,) = _make_lazy_cuda_func(
+-            "rasterize_to_pixels_from_world_3dgs_bwd"
+-        )(
++        (
++            v_means,
++            v_quats,
++            v_scales,
++            v_colors,
++            v_opacities,
++        ) = _make_lazy_cuda_func("rasterize_to_pixels_from_world_3dgs_bwd")(
+             means,
+             quats,
+             scales,
+@@ -1682,6 +1691,7 @@ def fully_fused_projection_2dgs(
+     radius_clip: float = 0.0,
+     packed: bool = False,
+     sparse_grad: bool = False,
++    texture_scale_multiplier: float = 1.0,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+     """Prepare Gaussians for rasterization
+ 
+@@ -1702,6 +1712,7 @@ def fully_fused_projection_2dgs(
+         packed: If True, the output tensors will be packed into a flattened tensor. Default: False.
+         sparse_grad (Experimental): This is only effective when `packed` is True. If True, during backward the gradients
+           of {`means`, `covars`, `quats`, `scales`} will be a sparse Tensor in COO layout. Default: False.
++        texture_scale_multiplier: Base radius scale for texture primitives. Default: 1.0.
+ 
+     Returns:
+         A tuple:
+@@ -1755,6 +1766,7 @@ def fully_fused_projection_2dgs(
+             far_plane,
+             radius_clip,
+             sparse_grad,
++            texture_scale_multiplier,
+         )
+     else:
+         return _FullyFusedProjection2DGS.apply(
+@@ -1769,6 +1781,7 @@ def fully_fused_projection_2dgs(
+             near_plane,
+             far_plane,
+             radius_clip,
++            texture_scale_multiplier,
+         )
+ 
+ 
+@@ -1789,6 +1802,7 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
+         near_plane: float,
+         far_plane: float,
+         radius_clip: float,
++        texture_scale_multiplier: float,
+     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+         radii, means2d, depths, ray_transforms, normals = _make_lazy_cuda_func(
+             "projection_2dgs_fused_fwd"
+@@ -1804,6 +1818,7 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
+             near_plane,
+             far_plane,
+             radius_clip,
++            texture_scale_multiplier,
+         )
+         ctx.save_for_backward(
+             means,
+@@ -1818,6 +1833,7 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
+         ctx.width = width
+         ctx.height = height
+         ctx.eps2d = eps2d
++        ctx.texture_scale_multiplier = texture_scale_multiplier
+ 
+         return radii, means2d, depths, ray_transforms, normals
+ 
+@@ -1836,6 +1852,7 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
+         width = ctx.width
+         height = ctx.height
+         eps2d = ctx.eps2d
++        texture_scale_multiplier = ctx.texture_scale_multiplier
+         v_means, v_quats, v_scales, v_viewmats = _make_lazy_cuda_func(
+             "projection_2dgs_fused_bwd"
+         )(
+@@ -1896,6 +1913,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
+         far_plane: float,
+         radius_clip: float,
+         sparse_grad: bool,
++        texture_scale_multiplier: float,
+     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+         (
+             indptr,
+@@ -1917,6 +1935,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
+             near_plane,
+             far_plane,
+             radius_clip,
++            texture_scale_multiplier,
+         )
+         ctx.save_for_backward(
+             camera_ids,
+@@ -1931,6 +1950,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
+         ctx.width = width
+         ctx.height = height
+         ctx.sparse_grad = sparse_grad
++        ctx.texture_scale_multiplier = texture_scale_multiplier
+ 
+         return camera_ids, gaussian_ids, radii, means2d, depths, ray_transforms, normals
+ 
+@@ -1958,6 +1978,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
+         width = ctx.width
+         height = ctx.height
+         sparse_grad = ctx.sparse_grad
++        texture_scale_multiplier = ctx.texture_scale_multiplier
+ 
+         v_means, v_quats, v_scales, v_viewmats = _make_lazy_cuda_func(
+             "projection_2dgs_packed_bwd"
+@@ -2051,6 +2072,11 @@ def rasterize_to_pixels_2dgs(
+     packed: bool = False,
+     absgrad: bool = False,
+     distloss: bool = False,
++    texture_colors: Optional[Tensor] = None,
++    texture_alphas: Optional[Tensor] = None,
++    texture_size: int = 0,
++    texture_color_sigma: float = 1.0,
++    texture_alpha_mode: TextureAlphaMode = TextureAlphaMode.TEXTURE,
+ ) -> Tuple[Tensor, Tensor]:
+     """Rasterize Gaussians to pixels.
+ 
+@@ -2068,6 +2094,16 @@ def rasterize_to_pixels_2dgs(
+         masks: Optional tile mask to skip rendering GS to masked tiles. [C, tile_height, tile_width]. Default: None.
+         packed: If True, the input tensors are expected to be packed with shape [nnz, ...]. Default: False.
+         absgrad: If True, the backward pass will compute a `.absgrad` attribute for `means2d`. Default: False.
++        distloss: If True, compute distortion loss for better geometry detail.
++        texture_colors: Optional texture colors for BBSplat-style rendering. Shape [N, 3, texture_h, texture_w]
++            if packed is False, [nnz, 3, texture_h, texture_w] if packed is True. Default: None.
++        texture_alphas: Optional texture alphas for BBSplat-style rendering. Shape [N, texture_h, texture_w]
++            if packed is False, [nnz, texture_h, texture_w] if packed is True. Default: None.
++        texture_size: Size of the square texture maps. Only needed when texture_colors and texture_alphas are provided. Default: 0.
++        texture_color_sigma: Sigma parameter for unbounded texture sampling. Default: 1.0.
++        texture_alpha_mode: Alpha computation mode - TextureAlphaMode.TEXTURE:
++            use only texture alpha (default), TextureAlphaMode.GAUSSIAN: use only 2DGS alpha,
++            TextureAlphaMode.MULTIPLY: multiply both. Default: TextureAlphaMode.TEXTURE.
+ 
+     Returns:
+         A tuple:
+@@ -2098,6 +2134,28 @@ def rasterize_to_pixels_2dgs(
+         assert backgrounds.shape == (C, colors.shape[-1]), backgrounds.shape
+         backgrounds = backgrounds.contiguous()
+ 
++    # Check if textures are enabled - only based on texture_colors
++    texture_enabled = texture_colors is not None
++
++    # Parameter validation for texture alpha modes when textures are enabled
++    if texture_enabled:
++        if (
++            texture_alpha_mode in [TextureAlphaMode.TEXTURE, TextureAlphaMode.MULTIPLY]
++            and texture_alphas is None
++        ):
++            # For enum class, we need to handle name access differently
++            try:
++                mode_name = texture_alpha_mode.name.lower()
++            except AttributeError:
++                # Fallback for bound enum
++                mode_name = str(texture_alpha_mode).split(".")[-1].lower()
++            raise ValueError(
++                f"texture_alphas must be provided when "
++                f"texture_alpha_mode='{mode_name}'"
++            )
++
++    # Use the bound enum directly (no conversion needed)
++
+     # Pad the channels to the nearest supported number if necessary
+     channels = colors.shape[-1]
+     if channels > 512 or channels == 0:
+@@ -2156,6 +2214,11 @@ def rasterize_to_pixels_2dgs(
+         flatten_ids.contiguous(),
+         absgrad,
+         distloss,
++        texture_colors.contiguous() if texture_colors is not None else None,
++        texture_alphas.contiguous() if texture_alphas is not None else None,
++        texture_size,
++        texture_color_sigma,
++        texture_alpha_mode,
+     )
+ 
+     if padded_channels > 0:
+@@ -2263,6 +2326,11 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
+         flatten_ids: Tensor,
+         absgrad: bool,
+         distloss: bool,
++        texture_colors: Optional[Tensor] = None,
++        texture_alphas: Optional[Tensor] = None,
++        texture_size: int = 0,
++        texture_color_sigma: float = 1.0,
++        texture_alpha_mode: TextureAlphaMode = TextureAlphaMode.TEXTURE,
+     ) -> Tuple[Tensor, Tensor]:
+         (
+             render_colors,
+@@ -2285,6 +2353,11 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
+             tile_size,
+             isect_offsets,
+             flatten_ids,
++            texture_colors,
++            texture_alphas,
++            texture_size,
++            texture_color_sigma,
++            texture_alpha_mode,
+         )
+ 
+         ctx.save_for_backward(
+@@ -2308,6 +2381,11 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
+         ctx.tile_size = tile_size
+         ctx.absgrad = absgrad
+         ctx.distloss = distloss
++        ctx.texture_colors = texture_colors
++        ctx.texture_alphas = texture_alphas
++        ctx.texture_size = texture_size
++        ctx.texture_color_sigma = texture_color_sigma
++        ctx.texture_alpha_mode = texture_alpha_mode
+ 
+         # doubel to float
+         render_alphas = render_alphas.float()
+@@ -2358,6 +2436,8 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
+             v_opacities,
+             v_normals,
+             v_densify,
++            v_texture_colors,
++            v_texture_alphas,
+         ) = _make_lazy_cuda_func("rasterize_to_pixels_2dgs_bwd")(
+             means2d,
+             ray_transforms,
+@@ -2382,6 +2462,11 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
+             v_render_distort.contiguous(),
+             v_render_median.contiguous(),
+             absgrad,
++            ctx.texture_colors if ctx.texture_colors is not None else None,
++            ctx.texture_alphas if ctx.texture_alphas is not None else None,
++            ctx.texture_size if ctx.texture_size is not None else None,
++            ctx.texture_color_sigma,
++            ctx.texture_alpha_mode,
+         )
+         torch.cuda.synchronize()
+         if absgrad:
+@@ -2402,12 +2487,17 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
+             v_normals,
+             v_densify,
+             v_backgrounds,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
+-            None,
++            None,  # masks
++            None,  # width
++            None,  # height
++            None,  # tile_size
++            None,  # isect_offsets
++            None,  # flatten_ids
++            None,  # absgrad
++            None,  # distloss
++            v_texture_colors if ctx.texture_colors is not None else None,
++            v_texture_alphas if ctx.texture_alphas is not None else None,
++            None,  # texture_size
++            None,  # texture_color_sigma
++            None,  # texture_alpha_mode
+         )
+diff --git a/gsplat/cuda/csrc/Projection.cpp b/gsplat/cuda/csrc/Projection.cpp
+index c6790cf..841ac9c 100644
+--- a/gsplat/cuda/csrc/Projection.cpp
++++ b/gsplat/cuda/csrc/Projection.cpp
+@@ -406,9 +406,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+ projection_ewa_3dgs_packed_bwd(
+     // fwd inputs
+     const at::Tensor means,                // [N, 3]
+-    const at::optional<at::Tensor> covars, // [N, 6]
+-    const at::optional<at::Tensor> quats,  // [N, 4]
+-    const at::optional<at::Tensor> scales, // [N, 3]
++    const at::optional<at::Tensor> covars, // [N, 6] optional
++    const at::optional<at::Tensor> quats,  // [N, 4] optional
++    const at::optional<at::Tensor> scales, // [N, 3] optional
+     const at::Tensor viewmats,             // [C, 4, 4]
+     const at::Tensor Ks,                   // [C, 3, 3]
+     const uint32_t image_width,
+@@ -533,7 +533,8 @@ projection_2dgs_fused_fwd(
+     const float eps2d,
+     const float near_plane,
+     const float far_plane,
+-    const float radius_clip
++    const float radius_clip,
++    const float texture_scale_multiplier
+ ) {
+     DEVICE_GUARD(means);
+     CHECK_INPUT(means);
+@@ -563,6 +564,7 @@ projection_2dgs_fused_fwd(
+         near_plane,
+         far_plane,
+         radius_clip,
++        texture_scale_multiplier,
+         // outputs
+         radii,
+         means2d,
+@@ -659,7 +661,8 @@ projection_2dgs_packed_fwd(
+     const uint32_t image_height,
+     const float near_plane,
+     const float far_plane,
+-    const float radius_clip
++    const float radius_clip,
++    const float texture_scale_multiplier
+ ) {
+     DEVICE_GUARD(means);
+     CHECK_INPUT(means);
+@@ -694,6 +697,7 @@ projection_2dgs_packed_fwd(
+             near_plane,
+             far_plane,
+             radius_clip,
++            texture_scale_multiplier,
+             c10::nullopt, // block_accum
+             // outputs
+             block_cnts,
+@@ -735,6 +739,7 @@ projection_2dgs_packed_fwd(
+             near_plane,
+             far_plane,
+             radius_clip,
++            texture_scale_multiplier,
+             block_accum,
+             // outputs
+             c10::nullopt, // block_cnts
+diff --git a/gsplat/cuda/csrc/Projection.h b/gsplat/cuda/csrc/Projection.h
+index cbdaabb..12762e6 100644
+--- a/gsplat/cuda/csrc/Projection.h
++++ b/gsplat/cuda/csrc/Projection.h
+@@ -162,6 +162,7 @@ void launch_projection_2dgs_fused_fwd_kernel(
+     const float near_plane,
+     const float far_plane,
+     const float radius_clip,
++    const float texture_scale_multiplier,
+     // outputs
+     at::Tensor radii,          // [C, N, 2]
+     at::Tensor means2d,        // [C, N, 2]
+@@ -206,6 +207,7 @@ void launch_projection_2dgs_packed_fwd_kernel(
+     const float near_plane,
+     const float far_plane,
+     const float radius_clip,
++    const float texture_scale_multiplier,
+     const at::optional<at::Tensor>
+         block_accum, // [C * blocks_per_row] packing helper
+     // outputs
+@@ -275,4 +277,4 @@ void launch_projection_ut_3dgs_fused_kernel(
+     at::optional<at::Tensor> compensations // [C, N] optional
+ );
+ 
+-} // namespace gsplat
+\ No newline at end of file
++} // namespace gsplat
+diff --git a/gsplat/cuda/csrc/Projection2DGSFused.cu b/gsplat/cuda/csrc/Projection2DGSFused.cu
+index 0a8f7b3..18d3f19 100644
+--- a/gsplat/cuda/csrc/Projection2DGSFused.cu
++++ b/gsplat/cuda/csrc/Projection2DGSFused.cu
+@@ -40,6 +40,7 @@ __global__ void projection_2dgs_fused_fwd_kernel(
+         far_plane, // Far clipping plane (for finite range used in z sorting)
+     const scalar_t radius_clip, // Radius clipping threshold (through away small
+                                 // primitives)
++    const scalar_t texture_scale_multiplier, // Base radius scale for texture primitives
+     // outputs
+     int32_t *__restrict__ radii, // [C, N, 2]   The maximum radius of the projected
+                                  // Gaussians in pixel unit. Int32 tensor.
+@@ -216,8 +217,9 @@ __global__ void projection_2dgs_fused_fwd_kernel(
+     const vec2 half_extend = mean2d * mean2d - temp;
+ 
+     // ==============================================
+-    const float radius_x = ceil(3.33f * sqrt(max(1e-4, half_extend.x)));
+-    const float radius_y = ceil(3.33f * sqrt(max(1e-4, half_extend.y)));
++    const float base_radius = 3.33f * texture_scale_multiplier;
++    const float radius_x = ceil(base_radius * sqrt(max(1e-4, half_extend.x)));
++    const float radius_y = ceil(base_radius * sqrt(max(1e-4, half_extend.y)));
+ 
+     if (radius_x <= radius_clip && radius_y <= radius_clip) {
+         radii[idx * 2] = 0;
+@@ -276,6 +278,7 @@ void launch_projection_2dgs_fused_fwd_kernel(
+     const float near_plane,
+     const float far_plane,
+     const float radius_clip,
++    const float texture_scale_multiplier,
+     // outputs
+     at::Tensor radii,          // [C, N, 2]
+     at::Tensor means2d,        // [C, N, 2]
+@@ -310,6 +313,7 @@ void launch_projection_2dgs_fused_fwd_kernel(
+             near_plane,
+             far_plane,
+             radius_clip,
++            texture_scale_multiplier,
+             radii.data_ptr<int32_t>(),
+             means2d.data_ptr<float>(),
+             depths.data_ptr<float>(),
+diff --git a/gsplat/cuda/csrc/Projection2DGSPacked.cu b/gsplat/cuda/csrc/Projection2DGSPacked.cu
+index b661509..39492e9 100644
+--- a/gsplat/cuda/csrc/Projection2DGSPacked.cu
++++ b/gsplat/cuda/csrc/Projection2DGSPacked.cu
+@@ -28,6 +28,7 @@ __global__ void projection_2dgs_packed_fwd_kernel(
+     const scalar_t near_plane,
+     const scalar_t far_plane,
+     const scalar_t radius_clip,
++    const scalar_t texture_scale_multiplier,
+     const int32_t
+         *__restrict__ block_accum,    // [C * blocks_per_row] packing helper
+     int32_t *__restrict__ block_cnts, // [C * blocks_per_row] packing helper
+@@ -117,8 +118,10 @@ __global__ void projection_2dgs_packed_fwd_kernel(
+ 
+         const vec2 temp = {sum(f * M0 * M0), sum(f * M1 * M1)};
+         const vec2 half_extend = mean2d * mean2d - temp;
+-        radius_x = ceil(3.33f * sqrt(max(1e-4, half_extend.x)));
+-        radius_y = ceil(3.33f * sqrt(max(1e-4, half_extend.y)));
++
++        const float base_radius = 3.33f * texture_scale_multiplier;
++        radius_x = ceil(base_radius * sqrt(max(1e-4, half_extend.x)));
++        radius_y = ceil(base_radius * sqrt(max(1e-4, half_extend.y)));
+ 
+         if (radius_x <= radius_clip && radius_y <= radius_clip) {
+             valid = false;
+@@ -207,6 +210,7 @@ void launch_projection_2dgs_packed_fwd_kernel(
+     const float near_plane,
+     const float far_plane,
+     const float radius_clip,
++    const float texture_scale_multiplier,
+     const at::optional<at::Tensor>
+         block_accum, // [C * blocks_per_row] packing helper
+     // outputs
+@@ -251,6 +255,7 @@ void launch_projection_2dgs_packed_fwd_kernel(
+             near_plane,
+             far_plane,
+             radius_clip,
++            texture_scale_multiplier,
+             block_accum.has_value() ? block_accum.value().data_ptr<int32_t>()
+                                     : nullptr,
+             block_cnts.has_value() ? block_cnts.value().data_ptr<int32_t>()
+@@ -512,4 +517,4 @@ void launch_projection_2dgs_packed_bwd_kernel(
+         );
+ }
+ 
+-} // namespace gsplat
+\ No newline at end of file
++} // namespace gsplat
+diff --git a/gsplat/cuda/csrc/Rasterization.cpp b/gsplat/cuda/csrc/Rasterization.cpp
+index 3e2874e..012cca7 100644
+--- a/gsplat/cuda/csrc/Rasterization.cpp
++++ b/gsplat/cuda/csrc/Rasterization.cpp
+@@ -1,6 +1,7 @@
+ #include <ATen/TensorUtils.h>
+ #include <ATen/core/Tensor.h>
+ #include <c10/cuda/CUDAGuard.h> // for DEVICE_GUARD
++#include <c10/util/Optional.h> // for c10::optional and c10::nullopt
+ #include <tuple>
+ 
+ #include <ATen/Functions.h>
+@@ -334,7 +335,13 @@ rasterize_to_pixels_2dgs_fwd(
+     const uint32_t tile_size,
+     // intersections
+     const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+-    const at::Tensor flatten_ids   // [n_isects]
++    const at::Tensor flatten_ids,  // [n_isects]
++    // texture parameters for BBSplat
++    const at::optional<at::Tensor> texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const at::optional<at::Tensor> texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size,      // texture_h (== texture_w)
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode  // texture alpha mode
+ ) {
+     DEVICE_GUARD(means2d);
+     CHECK_INPUT(means2d);
+@@ -350,6 +357,12 @@ rasterize_to_pixels_2dgs_fwd(
+     if (masks.has_value()) {
+         CHECK_INPUT(masks.value());
+     }
++    if (texture_colors.has_value()) {
++        CHECK_INPUT(texture_colors.value());
++    }
++    if (texture_alphas.has_value()) {
++        CHECK_INPUT(texture_alphas.value());
++    }
+     auto opt = means2d.options();
+ 
+     uint32_t C = tile_offsets.size(0); // number of cameras
+@@ -390,7 +403,12 @@ rasterize_to_pixels_2dgs_fwd(
+             render_distort,                                                    \
+             render_median,                                                     \
+             last_ids,                                                          \
+-            median_ids                                                         \
++            median_ids,                                                        \
++            texture_colors,                                                    \
++            texture_alphas,                                                    \
++            texture_size,                                                      \
++            texture_color_sigma,                                               \
++            texture_alpha_mode                                                 \
+         );                                                                     \
+         break;
+ 
+@@ -440,7 +458,9 @@ std::tuple<
+     at::Tensor,
+     at::Tensor,
+     at::Tensor,
+-    at::Tensor>
++    at::Tensor,
++    at::optional<at::Tensor>,
++    at::optional<at::Tensor>>
+ rasterize_to_pixels_2dgs_bwd(
+     // Gaussian parameters
+     const at::Tensor means2d,        // [C, N, 2] or [nnz, 2]
+@@ -470,7 +490,13 @@ rasterize_to_pixels_2dgs_bwd(
+     const at::Tensor v_render_distort, // [C, image_height, image_width, 1]
+     const at::Tensor v_render_median,  // [C, image_height, image_width, 1]
+     // options
+-    bool absgrad
++    bool absgrad,
++    // texture parameters for BBSplat
++    const at::optional<at::Tensor> texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const at::optional<at::Tensor> texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size,      // texture_h (== texture_w)
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode  // texture alpha mode
+ ) {
+     DEVICE_GUARD(means2d);
+     CHECK_INPUT(means2d);
+@@ -496,6 +522,12 @@ rasterize_to_pixels_2dgs_bwd(
+     if (masks.has_value()) {
+         CHECK_INPUT(masks.value());
+     }
++    if (texture_colors.has_value()) {
++        CHECK_INPUT(texture_colors.value());
++    }
++    if (texture_alphas.has_value()) {
++        CHECK_INPUT(texture_alphas.value());
++    }
+ 
+     uint32_t channels = colors.size(-1);
+ 
+@@ -510,6 +542,16 @@ rasterize_to_pixels_2dgs_bwd(
+     }
+     at::Tensor v_densify = at::zeros_like(densify);
+ 
++    // Create texture gradient tensors if textures are provided
++    at::optional<at::Tensor> v_texture_colors = c10::nullopt;
++    at::optional<at::Tensor> v_texture_alphas = c10::nullopt;
++    if (texture_colors.has_value()) {
++        v_texture_colors = at::zeros_like(texture_colors.value());
++    }
++    if (texture_alphas.has_value()) {
++        v_texture_alphas = at::zeros_like(texture_alphas.value());
++    }
++
+ #define __LAUNCH_KERNEL__(N)                                                   \
+     case N:                                                                    \
+         launch_rasterize_to_pixels_2dgs_bwd_kernel<N>(                         \
+@@ -541,7 +583,14 @@ rasterize_to_pixels_2dgs_bwd(
+             v_colors,                                                          \
+             v_opacities,                                                       \
+             v_normals,                                                         \
+-            v_densify                                                          \
++            v_densify,                                                         \
++            texture_colors,                                                    \
++            texture_alphas,                                                    \
++            texture_size,                                                      \
++            texture_color_sigma,                                               \
++            texture_alpha_mode,                                                \
++            v_texture_colors,                                                  \
++            v_texture_alphas                                                   \
+         );                                                                     \
+         break;
+ 
+@@ -580,7 +629,9 @@ rasterize_to_pixels_2dgs_bwd(
+         v_colors,
+         v_opacities,
+         v_normals,
+-        v_densify
++        v_densify,
++        texture_colors.has_value() ? c10::optional<at::Tensor>(v_texture_colors) : c10::nullopt,
++        texture_alphas.has_value() ? c10::optional<at::Tensor>(v_texture_alphas) : c10::nullopt
+     );
+ }
+ 
+@@ -704,7 +755,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
+     DEVICE_GUARD(means);
+     CHECK_INPUT(means);
+     CHECK_INPUT(quats);
+-    CHECK_INPUT(colors);
++    CHECK_INPUT(scales);
+     CHECK_INPUT(colors);
+     CHECK_INPUT(opacities);
+     CHECK_INPUT(tile_offsets);
+@@ -744,12 +795,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
+             viewmats0,                                                         \
+             viewmats1,                                                         \
+             Ks,                                                                \
+-            camera_model,                                                     \
+-            ut_params,                                                        \
+-            rs_type,                                                       \
+-            radial_coeffs,                                                    \
+-            tangential_coeffs,                                                \
+-            thin_prism_coeffs,                                               \
++            camera_model,                                                      \
++            ut_params,                                                         \
++            rs_type,                                                           \
++            radial_coeffs,                                                     \
++            tangential_coeffs,                                                 \
++            thin_prism_coeffs,                                                 \
+             tile_offsets,                                                      \
+             flatten_ids,                                                       \
+             renders,                                                           \
+@@ -868,12 +919,12 @@ rasterize_to_pixels_from_world_3dgs_bwd(
+             viewmats0,                                                         \
+             viewmats1,                                                         \
+             Ks,                                                                \
+-            camera_model,                                                     \
+-            ut_params,                                                        \
+-            rs_type,                                                       \
+-            radial_coeffs,                                                    \
+-            tangential_coeffs,                                                \
+-            thin_prism_coeffs,                                               \
++            camera_model,                                                      \
++            ut_params,                                                         \
++            rs_type,                                                           \
++            radial_coeffs,                                                     \
++            tangential_coeffs,                                                 \
++            thin_prism_coeffs,                                                 \
+             tile_offsets,                                                      \
+             flatten_ids,                                                       \
+             render_alphas,                                                     \
+diff --git a/gsplat/cuda/csrc/Rasterization.h b/gsplat/cuda/csrc/Rasterization.h
+index 8936765..bfaaac9 100644
+--- a/gsplat/cuda/csrc/Rasterization.h
++++ b/gsplat/cuda/csrc/Rasterization.h
+@@ -123,8 +123,15 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
+     at::Tensor render_distort, // [C, image_height, image_width, 1]
+     at::Tensor render_median,  // [C, image_height, image_width, 1]
+     at::Tensor last_ids,       // [C, image_height, image_width]
+-    at::Tensor median_ids      // [C, image_height, image_width]
++    at::Tensor median_ids,     // [C, image_height, image_width]
++    // texture parameters for BBSplat
++    const at::optional<at::Tensor> texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const at::optional<at::Tensor> texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size,      // texture_h (== texture_w)
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode  // texture alpha mode
+ );
++
+ template <uint32_t CDIM>
+ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
+     // Gaussian parameters
+@@ -161,7 +168,16 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
+     at::Tensor v_colors,                    // [C, N, 3] or [nnz, 3]
+     at::Tensor v_opacities,                 // [C, N] or [nnz]
+     at::Tensor v_normals,                   // [C, N, 3] or [nnz, 3]
+-    at::Tensor v_densify                    // [C, N, 2] or [nnz, 2]
++    at::Tensor v_densify,                   // [C, N, 2] or [nnz, 2]
++    // texture parameters for BBSplat
++    const at::optional<at::Tensor> texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const at::optional<at::Tensor> texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size,     // texture_h (== texture_w)
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode,  // texture alpha mode
++    // texture gradient outputs
++    at::optional<at::Tensor> v_texture_colors,     // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    at::optional<at::Tensor> v_texture_alphas      // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
+ );
+ 
+ /////////////////////////////////////////////////
+@@ -272,4 +288,4 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
+     at::Tensor v_opacities                  // [C, N] or [nnz]
+ ) ;
+ 
+-} // namespace gsplat
+\ No newline at end of file
++} // namespace gsplat
+diff --git a/gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu b/gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu
+index 3c32c75..607e49a 100644
+--- a/gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu
++++ b/gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu
+@@ -7,6 +7,7 @@
+ #include "Common.h"
+ #include "Rasterization.h"
+ #include "Utils.cuh"
++#include "GridSample.cuh"
+ 
+ namespace gsplat {
+ 
+@@ -41,7 +42,12 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+     const bool *__restrict__ masks, // [C, tile_height, tile_width]           //
+                                     // Optional tile mask to skip rendering GS
+                                     // to masked tiles.
+-
++    // BBSplat texture parameters
++    const scalar_t *__restrict__ texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const scalar_t *__restrict__ texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size, // texture_h (== texture_w) for square textures
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode,  // texture alpha mode
+     const uint32_t image_width,
+     const uint32_t image_height,
+     const uint32_t tile_size,
+@@ -86,7 +92,10 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+     scalar_t *__restrict__ v_colors,         // [C, N, CDIM] or [nnz, CDIM]
+     scalar_t *__restrict__ v_opacities,      // [C, N] or [nnz]
+     scalar_t *__restrict__ v_normals,        // [C, N, 3] or [nnz, 3]
+-    scalar_t *__restrict__ v_densify
++    scalar_t *__restrict__ v_densify,
++    // BBSplat texture gradients
++    scalar_t *__restrict__ v_texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    scalar_t *__restrict__ v_texture_alphas  // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
+ ) {
+     /**
+      * ==============================
+@@ -353,6 +362,11 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+              * Run through the forward pass, but only for the t-th primitive
+              * ==================================================
+              */
++            // Check if textures are enabled - only based on texture_colors (matches forward pass)
++            bool texture_enabled = texture_colors != nullptr;
++            // Cache for sampled texture colors, unused if texture_enabled is false
++            float sampled_colors[3] = {0.f, 0.f, 0.f};
++
+             if (valid) {
+                 vec3 xy_opac = xy_opacity_batch[t];
+ 
+@@ -373,7 +387,8 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+                     valid = false;
+                 s = {ray_cross.x / ray_cross.z, ray_cross.y / ray_cross.z};
+ 
+-                // GAUSSIAN KERNEL EVALUATION
++                // ALPHA COMPUTATION - Always compute Gaussian alphas first (matches forward pass)
++                // point of intersection in uv space
+                 gauss_weight_3d = s.x * s.x + s.y * s.y;
+                 d = {xy_opac.x - px, xy_opac.y - py};
+ 
+@@ -385,14 +400,86 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+                 // visibility and alpha
+                 const float sigma = 0.5f * gauss_weight;
+                 vis = __expf(-sigma);
+-                alpha = min(0.999f, opac * vis); // clipped alpha
++                float gaussian_alpha = min(0.999f, opac * vis); // clipped alpha
++
++                // Initialize final alpha with Gaussian alpha (default)
++                alpha = gaussian_alpha;
++
++                // Handle texture-based alpha computation if textures are enabled
++                if (texture_enabled) {
++                    if (texture_alpha_mode == TextureAlphaMode::TEXTURE) {
++                        // Pure texture alpha mode - requires texture_alphas
++                        if (texture_alphas != nullptr) {
++                            int32_t g = id_batch[t];
++                            int32_t gaussian_id = packed ? g : (g % N);
++                            int texture_pixels = texture_size * texture_size;
++                            int texture_offset = gaussian_id * texture_pixels;
++
++                            float sampled_alpha_array[1];
++                            // Texture alpha always uses regular bilinear sampling, never unbounded
++                            gsplat::bbsplat::bilinear_texture_sampler(
++                                /*result=*/sampled_alpha_array,
++                                /*u=*/s.x,
++                                /*v=*/s.y,
++                                /*texture=*/texture_alphas + texture_offset,
++                                /*texture_size=*/texture_size,
++                                /*channels=*/1,
++                                /*texture_normalize=*/false,
++                                /*texture_crop=*/false
++                            );
++                            alpha = min(0.999f, sampled_alpha_array[0]);
++                        }
++                    } else if (texture_alpha_mode == TextureAlphaMode::MULTIPLY) {
++                        // Multiply texture alpha with Gaussian alpha - requires texture_alphas
++                        if (texture_alphas != nullptr) {
++                            int32_t g = id_batch[t];
++                            int32_t gaussian_id = packed ? g : (g % N);
++                            int texture_pixels = texture_size * texture_size;
++                            int texture_offset = gaussian_id * texture_pixels;
++
++                            float sampled_alpha_array[1];
++                            // Texture alpha always uses regular bilinear sampling, never unbounded
++                            gsplat::bbsplat::bilinear_texture_sampler(
++                                /*result=*/sampled_alpha_array,
++                                /*u=*/s.x,
++                                /*v=*/s.y,
++                                /*texture=*/texture_alphas + texture_offset,
++                                /*texture_size=*/texture_size,
++                                /*channels=*/1,
++                                /*texture_normalize=*/false,
++                                /*texture_crop=*/false
++                            );
++                            float texture_alpha_sampled = min(0.999f, sampled_alpha_array[0]);
++                            alpha = texture_alpha_sampled * gaussian_alpha;
++                        }
++                    }
++                    // For GAUSSIAN mode, alpha remains as gaussian_alpha
++                }
+ 
+-                // gaussian throw out
+-                if (sigma < 0.f || alpha < ALPHA_THRESHOLD) {
++                // ignore transparent gaussians
++                if (alpha < ALPHA_THRESHOLD) {
+                     valid = false;
+                 }
+             }
+ 
++            // If textures are used, sample color texture once here
++            if (valid && texture_enabled) {
++                int32_t g = id_batch[t];
++                int32_t gaussian_id = packed ? g : (g % N);
++                int texture_pixels = texture_size * texture_size;
++                int color_texture_offset = gaussian_id * texture_pixels * 3;
++
++                gsplat::bbsplat::bilinear_texture_sampler_unbounded(
++                    /*result=*/sampled_colors,
++                    /*u=*/s.x,
++                    /*v=*/s.y,
++                    /*texture=*/texture_colors + color_texture_offset,
++                    /*texture_size=*/texture_size,
++                    /*channels=*/3,
++                    /*texture_sigma=*/texture_color_sigma
++                );
++            }
++
+             // if all threads are inactive in this warp, skip this loop
+             if (!warp.any(valid)) {
+                 continue;
+@@ -459,6 +546,11 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+                 const float fac = alpha * T;
+ #pragma unroll
+                 for (uint32_t k = 0; k < CDIM; ++k) {
++                    float rendered_color_k = rgbs_batch[t * CDIM + k];
++                    if (texture_enabled && k < 3) {
++                        rendered_color_k += sampled_colors[k];
++                    }
++
+                     v_rgb_local[k] += fac * v_render_c[k];
+                 }
+ 
+@@ -468,7 +560,12 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+                 // symbolic differentiation of a_i with respect to c_out
+                 float v_alpha = 0.f;
+                 for (uint32_t k = 0; k < CDIM; ++k) {
+-                    v_alpha += (rgbs_batch[t * CDIM + k] * T - buffer[k] * ra) *
++                    float rendered_color_k = rgbs_batch[t * CDIM + k];
++                    if (texture_enabled && k < 3) {
++                        rendered_color_k += sampled_colors[k];
++                    }
++
++                    v_alpha += (rendered_color_k * T - buffer[k] * ra) *
+                                v_render_c[k];
+                 }
+ 
+@@ -526,12 +623,198 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+                                              v_distort;
+                 }
+ 
++
++
+                 /** ==================================================
+                  * 2DGS backward pass: compute gradients of d_out / d_G_i and
+                  * d_G_i w.r.t geometry parameters
+                  * ==================================================
+                  */
+-                if (opac * vis <= 0.999f) {
++                if (texture_enabled) {
++                    // Handle different texture alpha modes (matches forward pass logic)
++                    if (texture_alpha_mode == TextureAlphaMode::TEXTURE) {
++                        // For texture mode, alpha gradients flow to texture, not opacity
++                        v_opacity_local = 0.f;
++                    } else if (texture_alpha_mode == TextureAlphaMode::GAUSSIAN) {
++                        // For gaussian mode, alpha gradients flow to opacity, not texture
++                        // No texture gradients needed, skip to end of texture_enabled block
++                        v_opacity_local = vis * v_alpha;
++                    } else if (texture_alpha_mode == TextureAlphaMode::MULTIPLY) {
++                        // For multiply mode, alpha gradients need to be split properly
++                        // In forward: alpha = texture_alpha * gaussian_alpha
++                        // So d(loss)/d(gaussian_alpha) = d(loss)/d(alpha) * texture_alpha
++                        // Need to recompute texture_alpha_sampled from forward pass
++                        if (texture_alphas != nullptr) {
++                            int32_t g = id_batch[t];
++                            int32_t gaussian_id = packed ? g : (g % N);
++                            int texture_pixels = texture_size * texture_size;
++                            int texture_offset = gaussian_id * texture_pixels;
++
++                            float sampled_alpha_array[1];
++                            gsplat::bbsplat::bilinear_texture_sampler(
++                                /*result=*/sampled_alpha_array,
++                                /*u=*/s.x,
++                                /*v=*/s.y,
++                                /*texture=*/texture_alphas + texture_offset,
++                                /*texture_size=*/texture_size,
++                                /*channels=*/1,
++                                /*texture_normalize=*/false,
++                                /*texture_crop=*/false
++                            );
++                            float texture_alpha_sampled = min(0.999f, sampled_alpha_array[0]);
++                            v_opacity_local = vis * v_alpha * texture_alpha_sampled;
++                        } else {
++                            v_opacity_local = vis * v_alpha; // fallback
++                        }
++                    }
++
++                    // Always compute ray transform gradients for texture colors
++                    // But only compute texture alpha gradients for modes that use texture alpha
++                    if (true) { // Always compute ray transform gradients for texture colors
++                        float v_depth = 0.f;
++                        // Get the accumulated UV gradients from texture sampling
++                        vec2 v_s_from_texture = {0.0f, 0.0f};
++
++                        // Texture colors contribute to UV gradients
++                        if (texture_enabled) {
++                            int32_t g = id_batch[t];
++                            int32_t gaussian_id = packed ? g : (g % N);
++                            int texture_pixels = texture_size * texture_size;
++                            int color_texture_offset = gaussian_id * texture_pixels * 3;
++
++                            float v_texture_color_sampled[3];
++                            for (uint32_t k = 0; k < 3; ++k) {
++                                v_texture_color_sampled[k] = fac * v_render_c[k];
++                            }
++
++                            vec2 uv_grad = gsplat::bbsplat::backward_bilinear_texture_sampler_unbounded(
++                                /*perchannel_grads=*/v_texture_color_sampled,
++                                /*u=*/s.x,
++                                /*v=*/s.y,
++                                /*texture=*/texture_colors + color_texture_offset,
++                                /*grad_input=*/v_texture_colors + color_texture_offset,
++                                /*texture_size=*/texture_size,
++                                /*channels=*/3,
++                                /*texture_sigma=*/texture_color_sigma
++                            );
++                            v_s_from_texture.x += uv_grad.x;
++                            v_s_from_texture.y += uv_grad.y;
++                        }
++
++                        // Texture alpha contributes to UV gradients for TEXTURE and MULTIPLY modes only
++                        if ((texture_alpha_mode == TextureAlphaMode::TEXTURE || texture_alpha_mode == TextureAlphaMode::MULTIPLY) && texture_alphas != nullptr) {
++                            int32_t g = id_batch[t];
++                            int32_t gaussian_id = packed ? g : (g % N);
++                            int texture_pixels = texture_size * texture_size;
++                            int alpha_texture_offset = gaussian_id * texture_pixels;
++
++                            // For MULTIPLY mode, need to scale gradient by gaussian_alpha
++                            // Forward: alpha = texture_alpha * gaussian_alpha
++                            // So d(loss)/d(texture_alpha) = d(loss)/d(alpha) * gaussian_alpha
++                            float texture_alpha_grad = v_alpha;
++                            if (texture_alpha_mode == TextureAlphaMode::MULTIPLY) {
++                                // Recompute gaussian_alpha from the forward pass
++                                float gaussian_alpha_recomputed = min(0.999f, opac * vis);
++                                texture_alpha_grad = v_alpha * gaussian_alpha_recomputed;
++                            }
++
++                            float v_texture_alpha_sampled[1] = {texture_alpha_grad};
++
++                            // Texture alpha always uses regular bilinear sampling, never unbounded
++                            vec2 uv_grad = gsplat::bbsplat::backward_bilinear_texture_sampler(
++                                /*perchannel_grads=*/v_texture_alpha_sampled,
++                                /*u=*/s.x,
++                                /*v=*/s.y,
++                                /*texture=*/texture_alphas + alpha_texture_offset,
++                                /*grad_input=*/v_texture_alphas + alpha_texture_offset,
++                                /*texture_size=*/texture_size,
++                                /*channels=*/1,
++                                /*texture_normalize=*/false,
++                                /*texture_crop=*/false
++                            );
++                            v_s_from_texture.x += uv_grad.x;
++                            v_s_from_texture.y += uv_grad.y;
++                        }
++
++                        // For GAUSSIAN and MULTIPLY modes, also include gradients from Gaussian alpha computation
++                        if (texture_alpha_mode == TextureAlphaMode::GAUSSIAN || texture_alpha_mode == TextureAlphaMode::MULTIPLY) {
++                            // Add gradients from gaussian weight computation (similar to original 2DGS)
++                            float v_depth = 0.f;
++                            float v_alpha_to_gaussian = v_alpha;
++                            if (texture_alpha_mode == TextureAlphaMode::MULTIPLY) {
++                                // Need to scale by texture_alpha_sampled since alpha = texture_alpha * gaussian_alpha
++                                // Recompute texture_alpha_sampled
++                                if (texture_alphas != nullptr) {
++                                    int32_t g = id_batch[t];
++                                    int32_t gaussian_id = packed ? g : (g % N);
++                                    int texture_pixels = texture_size * texture_size;
++                                    int texture_offset = gaussian_id * texture_pixels;
++
++                                    float sampled_alpha_array[1];
++                                    gsplat::bbsplat::bilinear_texture_sampler(
++                                        /*result=*/sampled_alpha_array,
++                                        /*u=*/s.x,
++                                        /*v=*/s.y,
++                                        /*texture=*/texture_alphas + texture_offset,
++                                        /*texture_size=*/texture_size,
++                                        /*channels=*/1,
++                                        /*texture_normalize=*/false,
++                                        /*texture_crop=*/false
++                                    );
++                                    float texture_alpha_sampled = min(0.999f, sampled_alpha_array[0]);
++                                    v_alpha_to_gaussian = v_alpha * texture_alpha_sampled;
++                                }
++                            }
++                            const float v_G = opac * v_alpha_to_gaussian;
++
++                            if (gauss_weight_3d <= gauss_weight_2d) {
++                                // derivative of G_i w.r.t. ray-primitive intersection uv coordinates
++                                const vec2 v_s_gaussian = {
++                                    v_G * -vis * s.x + v_depth * w_M.x,
++                                    v_G * -vis * s.y + v_depth * w_M.y
++                                };
++                                v_s_from_texture.x += v_s_gaussian.x;
++                                v_s_from_texture.y += v_s_gaussian.y;
++                            } else {
++                                // 2D gaussian weight was used - need to add those gradients to v_xy_local
++                                // But since this is inside texture_enabled block, we handle it separately
++                                const float v_G_ddelx = -vis * FILTER_INV_SQUARE_2DGS * d.x;
++                                const float v_G_ddely = -vis * FILTER_INV_SQUARE_2DGS * d.y;
++                                v_xy_local = {v_G * v_G_ddelx, v_G * v_G_ddely};
++                                if (v_means2d_abs != nullptr) {
++                                    v_xy_abs_local = {abs(v_xy_local.x), abs(v_xy_local.y)};
++                                }
++                            }
++                        }
++
++                        // Now compute ray transform gradients from UV gradients
++                        const vec2 v_s = {
++                            v_s_from_texture.x + v_depth * w_M.x,
++                            v_s_from_texture.y + v_depth * w_M.y
++                        };
++
++                        // backward through the projective transform
++                        const vec3 v_z_w_M = {s.x, s.y, 1.0};
++                        const float v_sx_pz = v_s.x / ray_cross.z;
++                        const float v_sy_pz = v_s.y / ray_cross.z;
++                        const vec3 v_ray_cross = {
++                            v_sx_pz, v_sy_pz, -(v_sx_pz * s.x + v_sy_pz * s.y)
++                        };
++                        const vec3 v_h_u = glm::cross(h_v, v_ray_cross);
++                        const vec3 v_h_v = glm::cross(v_ray_cross, h_u);
++
++                        // derivative of ray-primitive intersection uv
++                        // coordinates w.r.t. transformation (geometry)
++                        // coefficients
++                        v_u_M_local = {-v_h_u.x, -v_h_u.y, -v_h_u.z};
++                        v_v_M_local = {-v_h_v.x, -v_h_v.y, -v_h_v.z};
++                        v_w_M_local = {
++                            px * v_h_u.x + py * v_h_v.x + v_depth * v_z_w_M.x,
++                            px * v_h_u.y + py * v_h_v.y + v_depth * v_z_w_M.y,
++                            px * v_h_u.z + py * v_h_v.z + v_depth * v_z_w_M.z
++                        };
++                    }
++                } else if (opac * vis <= 0.999f) {
+                     float v_depth = 0.f;
+                     // d(a_i * G_i) / d(G_i) = a_i
+                     const float v_G = opac * v_alpha;
+@@ -595,7 +878,12 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+  */
+ #pragma unroll
+                 for (uint32_t k = 0; k < CDIM; ++k) {
+-                    buffer[k] += rgbs_batch[t * CDIM + k] * fac;
++                    float rendered_color_k = rgbs_batch[t * CDIM + k];
++                    if (texture_enabled && k < 3) {
++                        rendered_color_k += sampled_colors[k];
++                    }
++
++                    buffer[k] += rendered_color_k * fac;
+                 }
+ 
+ /**
+@@ -717,7 +1005,16 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
+     at::Tensor v_colors,                    // [C, N, 3] or [nnz, 3]
+     at::Tensor v_opacities,                 // [C, N] or [nnz]
+     at::Tensor v_normals,                   // [C, N, 3] or [nnz, 3]
+-    at::Tensor v_densify                    // [C, N, 2] or [nnz, 2]
++    at::Tensor v_densify,                   // [C, N, 2] or [nnz, 2]
++    // texture parameters for BBSplat
++    const at::optional<at::Tensor> texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const at::optional<at::Tensor> texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size,      // texture_h (== texture_w)
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode,     // texture alpha mode
++    // texture gradient outputs
++    at::optional<at::Tensor> v_texture_colors,     // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    at::optional<at::Tensor> v_texture_alphas      // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
+ ) {
+     bool packed = means2d.dim() == 2;
+ 
+@@ -771,6 +1068,13 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
+             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
+                                     : nullptr,
+             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
++            texture_colors.has_value() ? texture_colors.value().data_ptr<float>()
++                                      : nullptr,
++            texture_alphas.has_value() ? texture_alphas.value().data_ptr<float>()
++                                      : nullptr,
++            texture_size,
++            texture_color_sigma,
++            texture_alpha_mode,
+             image_width,
+             image_height,
+             tile_size,
+@@ -797,7 +1101,11 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
+             v_colors.data_ptr<float>(),
+             v_opacities.data_ptr<float>(),
+             v_normals.data_ptr<float>(),
+-            v_densify.data_ptr<float>()
++            v_densify.data_ptr<float>(),
++            v_texture_colors.has_value() ? v_texture_colors.value().data_ptr<float>()
++                                         : nullptr,
++            v_texture_alphas.has_value() ? v_texture_alphas.value().data_ptr<float>()
++                                         : nullptr
+         );
+ }
+ 
+@@ -834,7 +1142,14 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
+         const at::Tensor v_colors,                                             \
+         const at::Tensor v_opacities,                                          \
+         const at::Tensor v_normals,                                            \
+-        const at::Tensor v_densify                                             \
++        const at::Tensor v_densify,                                            \
++        const at::optional<at::Tensor> texture_colors,                         \
++        const at::optional<at::Tensor> texture_alphas,                         \
++        const uint32_t texture_size,                                           \
++        const float texture_color_sigma,                                       \
++        const TextureAlphaMode texture_alpha_mode,                             \
++        at::optional<at::Tensor> v_texture_colors,                             \
++        at::optional<at::Tensor> v_texture_alphas                              \
+     );
+ 
+ __INS__(1)
+diff --git a/gsplat/cuda/csrc/RasterizeToPixels2DGSFwd.cu b/gsplat/cuda/csrc/RasterizeToPixels2DGSFwd.cu
+index e8dfe30..c1822b5 100644
+--- a/gsplat/cuda/csrc/RasterizeToPixels2DGSFwd.cu
++++ b/gsplat/cuda/csrc/RasterizeToPixels2DGSFwd.cu
+@@ -5,6 +5,7 @@
+ 
+ #include "Common.h"
+ #include "Rasterization.h"
++#include "GridSample.cuh"
+ 
+ namespace gsplat {
+ 
+@@ -42,6 +43,12 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
+     const bool *__restrict__ masks, // [C, tile_height, tile_width] // Optional
+                                     // tile mask to skip rendering GS to masked
+                                     // tiles.
++    // BBSplat texture parameters
++    const scalar_t *__restrict__ texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w] - RGB textures
++    const scalar_t *__restrict__ texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w] - Alpha textures
++    const uint32_t texture_size, // texture_h (== texture_w) for square textures
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode,  // texture alpha mode
+     const uint32_t image_width,
+     const uint32_t image_height,
+     const uint32_t tile_size,
+@@ -342,9 +349,11 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
+             const vec2 s =
+                 vec2(ray_cross.x / ray_cross.z, ray_cross.y / ray_cross.z);
+ 
+-            // IMPORTANT: This is where the gaussian kernel is evaluated!!!!!
++            // Check if textures are enabled - only based on texture_colors
++            bool texture_enabled = texture_colors != nullptr;
+ 
+-            // point of interseciton in uv space
++            // Always compute Gaussian alphas first (needed for all modes except pure TEXTURE)
++            // point of intersection in uv space
+             const float gauss_weight_3d = s.x * s.x + s.y * s.y;
+ 
+             // projected gaussian kernel
+@@ -358,10 +367,64 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
+ 
+             const float sigma = 0.5f * gauss_weight;
+             // evaluation of the gaussian exponential term
+-            float alpha = min(0.999f, opac * __expf(-sigma));
++            float gaussian_alpha = min(0.999f, opac * __expf(-sigma));
++
++            // Initialize final alpha with Gaussian alpha (default)
++            float alpha = gaussian_alpha;
++
++            // Handle texture-based alpha computation if textures are enabled
++            if (texture_enabled) {
++                if (texture_alpha_mode == TextureAlphaMode::TEXTURE) {
++                    // Pure texture alpha mode - requires texture_alphas
++                    if (texture_alphas != nullptr) {
++                        int32_t g = id_batch[t];
++                        int32_t gaussian_id = packed ? g : (g % N);
++                        int texture_pixels = texture_size * texture_size;
++                        int texture_offset = gaussian_id * texture_pixels;
++
++                        float sampled_alpha_array[1];
++                        // Texture alpha always uses regular bilinear sampling, never unbounded
++                        gsplat::bbsplat::bilinear_texture_sampler(
++                            /*result=*/sampled_alpha_array,
++                            /*u=*/s.x,
++                            /*v=*/s.y,
++                            /*texture=*/texture_alphas + texture_offset,
++                            /*texture_size=*/texture_size,
++                            /*channels=*/1,
++                            /*texture_normalize=*/false,
++                            /*texture_crop=*/false
++                        );
++                        alpha = min(0.999f, sampled_alpha_array[0]);
++                    }
++                } else if (texture_alpha_mode == TextureAlphaMode::MULTIPLY) {
++                    // Multiply texture alpha with Gaussian alpha - requires texture_alphas
++                    if (texture_alphas != nullptr) {
++                        int32_t g = id_batch[t];
++                        int32_t gaussian_id = packed ? g : (g % N);
++                        int texture_pixels = texture_size * texture_size;
++                        int texture_offset = gaussian_id * texture_pixels;
++
++                        float sampled_alpha_array[1];
++                        // Texture alpha always uses regular bilinear sampling, never unbounded
++                        gsplat::bbsplat::bilinear_texture_sampler(
++                            /*result=*/sampled_alpha_array,
++                            /*u=*/s.x,
++                            /*v=*/s.y,
++                            /*texture=*/texture_alphas + texture_offset,
++                            /*texture_size=*/texture_size,
++                            /*channels=*/1,
++                            /*texture_normalize=*/false,
++                            /*texture_crop=*/false
++                        );
++                        float texture_alpha_sampled = min(0.999f, sampled_alpha_array[0]);
++                        alpha = texture_alpha_sampled * gaussian_alpha;
++                    }
++                }
++                // For GAUSSIAN mode, alpha remains as gaussian_alpha
++            }
+ 
+             // ignore transparent gaussians
+-            if (sigma < 0.f || alpha < ALPHA_THRESHOLD) {
++            if (alpha < ALPHA_THRESHOLD) {
+                 continue;
+             }
+ 
+@@ -375,9 +438,43 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
+             int32_t g = id_batch[t];
+             const float vis = alpha * T;
+             const float *c_ptr = colors + g * CDIM;
++
++            if (texture_colors != nullptr) {
++                // BBSplat: Sample texture colors and combine with base colors
++                // Convert flattened camera-gaussian index to gaussian index for texture access
++                int32_t gaussian_id = packed ? g : (g % N);
++                int texture_pixels = texture_size * texture_size;
++                int color_texture_offset = gaussian_id * texture_pixels * 3; // RGB channels
++
++                float sampled_color_array[3];
++                gsplat::bbsplat::bilinear_texture_sampler_unbounded(
++                    /*result=*/sampled_color_array,
++                    /*u=*/s.x,
++                    /*v=*/s.y,
++                    /*texture=*/texture_colors + color_texture_offset,
++                    /*texture_size=*/texture_size,
++                    /*channels=*/3,
++                    /*texture_sigma=*/texture_color_sigma
++                );
++
++                // BBSplat rendering equation: color = (sampled_texture_color + base_color)
++                // Note: The alpha component is already handled in the opacity computation above
++#pragma unroll
++                for (uint32_t k = 0; k < min(CDIM, 3U); ++k) {
++                    float final_color = sampled_color_array[k] + c_ptr[k];
++                    pix_out[k] += final_color * vis;
++                }
++                // Handle remaining channels (e.g., depth) without texture sampling
++#pragma unroll
++                for (uint32_t k = 3; k < CDIM; ++k) {
++                    pix_out[k] += c_ptr[k] * vis;
++                }
++            } else {
++                // Original 2DGS: Use base colors directly
+ #pragma unroll
+-            for (uint32_t k = 0; k < CDIM; ++k) {
+-                pix_out[k] += c_ptr[k] * vis;
++                for (uint32_t k = 0; k < CDIM; ++k) {
++                    pix_out[k] += c_ptr[k] * vis;
++                }
+             }
+ 
+             const float *n_ptr = normals + g * 3;
+@@ -464,7 +561,13 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
+     at::Tensor render_distort, // [C, image_height, image_width]
+     at::Tensor render_median,  // [C, image_height, image_width]
+     at::Tensor last_ids,       // [C, image_height, image_width]
+-    at::Tensor median_ids      // [C, image_height, image_width]
++    at::Tensor median_ids,     // [C, image_height, image_width]
++    // texture parameters for BBSplat
++    const at::optional<at::Tensor> texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const at::optional<at::Tensor> texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size,      // texture_h (== texture_w)
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode  // texture alpha mode
+ ) {
+     bool packed = means2d.dim() == 2;
+ 
+@@ -512,6 +615,13 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
+             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
+                                     : nullptr,
+             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
++            texture_colors.has_value() ? texture_colors.value().data_ptr<float>()
++                                       : nullptr,
++            texture_alphas.has_value() ? texture_alphas.value().data_ptr<float>()
++                                       : nullptr,
++            texture_size,
++            texture_color_sigma,
++            texture_alpha_mode,
+             image_width,
+             image_height,
+             tile_size,
+@@ -552,7 +662,12 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
+         at::Tensor render_distort,                                             \
+         at::Tensor render_median,                                              \
+         at::Tensor last_ids,                                                   \
+-        at::Tensor median_ids                                                  \
++        at::Tensor median_ids,                                                 \
++        const at::optional<at::Tensor> texture_colors,                         \
++        const at::optional<at::Tensor> texture_alphas,                         \
++        const uint32_t texture_size,                                           \
++        const float texture_color_sigma,                                       \
++        const TextureAlphaMode texture_alpha_mode                              \
+     );
+ 
+ __INS__(1)
+diff --git a/gsplat/cuda/ext.cpp b/gsplat/cuda/ext.cpp
+index 79d58ca..0d5067d 100644
+--- a/gsplat/cuda/ext.cpp
++++ b/gsplat/cuda/ext.cpp
+@@ -11,6 +11,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+         .value("FISHEYE", gsplat::CameraModelType::FISHEYE)
+         .export_values();
+ 
++    py::enum_<gsplat::TextureAlphaMode>(m, "TextureAlphaMode")
++        .value("TEXTURE", gsplat::TextureAlphaMode::TEXTURE)
++        .value("GAUSSIAN", gsplat::TextureAlphaMode::GAUSSIAN)
++        .value("MULTIPLY", gsplat::TextureAlphaMode::MULTIPLY)
++        .export_values();
++
+     m.def("null", &gsplat::null);
+ 
+     m.def(
+diff --git a/gsplat/cuda/include/Common.h b/gsplat/cuda/include/Common.h
+index 5ac28d5..4780ebb 100644
+--- a/gsplat/cuda/include/Common.h
++++ b/gsplat/cuda/include/Common.h
+@@ -49,7 +49,16 @@ enum CameraModelType {
+     FISHEYE = 2,
+ };
+ 
++//
++// Texture Alpha Modes for BBSplat
++//
++enum class TextureAlphaMode {
++    TEXTURE = 0,  // Use only BBSplat sampled texture_alpha (default)
++    GAUSSIAN = 1, // Use only 2DGS Gaussian decay alpha
++    MULTIPLY = 2, // Multiply BBSplat texture_alpha * 2DGS Gaussian alpha
++};
++
+ #define N_THREADS_PACKED 256
+ #define ALPHA_THRESHOLD (1.f / 255.f)
+ 
+-} // namespace gsplat
+\ No newline at end of file
++} // namespace gsplat
+diff --git a/gsplat/cuda/include/GridSample.cuh b/gsplat/cuda/include/GridSample.cuh
+new file mode 100644
+index 0000000..f9027f5
+--- /dev/null
++++ b/gsplat/cuda/include/GridSample.cuh
+@@ -0,0 +1,521 @@
++#pragma once
++
++#include "Common.h"
++
++namespace gsplat {
++namespace bbsplat {
++
++// Bilinear texture sampler with border clamping (unbounded)
++//
++// When texture_sigma == 1.0f, it's strictly equivalent to:
++// - PyTorch's grid_sample with
++//   - mode="bilinear"
++//   - padding_mode="border"
++//   - align_corners=False
++// - OpenGL's
++//   - GL_LINEAR
++//   - GL_CLAMP_TO_EDGE
++//
++// The goal of the sampling is to map texture uv to actual texel value.
++// The larger the sigma, the larger the BBSplat span in the 2DGS primitive.
++inline __device__ void bilinear_texture_sampler_unbounded(
++    float *result,
++    float u,
++    float v,
++    const float *__restrict__ texture,
++    int texture_size,
++    int channels,
++    float texture_sigma = 1.0f
++) {
++    // sigma == 1.0f
++    // - u                             : [-1, 1]
++    // - (u + 1.0f) / 2.0f             : [0, 1]
++    // - (u + 1.0f) / 2.0f * ts        : [0, ts] (im_coords)
++    // - (u + 1.0f) / 2.0f * ts - 0.5f : [-0.5, ts - 0.5] (pix_coords)
++    // - clamped                       : [0, ts - 1]
++    //
++    // general sigma
++    // - u                              : [-s, s]
++    // - (u + s) / (2.0 * s)            : [0, 1]
++    // - (u + s) / (2.0 * s) * ts       : [0, ts] (im_coords)
++    // - (u + s) / (2.0 * s) * ts - 0.5f: [-0.5, ts - 0.5] (pix_coords)
++    // - clamped                        : [0, ts - 1]
++    float x =
++        (u + texture_sigma) / (2.0f * texture_sigma) * texture_size - 0.5f;
++    float y =
++        (v + texture_sigma) / (2.0f * texture_sigma) * texture_size - 0.5f;
++
++    // Apply border clamping (equivalent to padding_mode="border")
++    x = fmaxf(0.0f, fminf(texture_size - 1.0f, x));
++    y = fmaxf(0.0f, fminf(texture_size - 1.0f, y));
++
++    // Get integer coordinates for the 4 surrounding pixels
++    int ix_nw = static_cast<int>(::floor(x));
++    int iy_nw = static_cast<int>(::floor(y));
++    int ix_ne = min(ix_nw + 1, texture_size - 1);
++    int iy_ne = iy_nw;
++    int ix_sw = ix_nw;
++    int iy_sw = min(iy_nw + 1, texture_size - 1);
++    int ix_se = ix_ne;
++    int iy_se = iy_sw;
++
++    // Get fractional parts for interpolation
++    float f_x = x - ix_nw;
++    float f_y = y - iy_nw;
++
++    // Calculate bilinear weights
++    float nw = (1.0f - f_x) * (1.0f - f_y);
++    float ne = f_x * (1.0f - f_y);
++    float sw = (1.0f - f_x) * f_y;
++    float se = f_x * f_y;
++
++    // Calculate bilinear weighted pixel value and set output pixel
++    int texture_area = texture_size * texture_size;
++    for (int c = 0; c < channels; ++c) {
++        int channel_offset = c * texture_area;
++
++        result[c] = 0;
++        result[c] +=
++            nw * texture[channel_offset + iy_nw * texture_size + ix_nw];
++        result[c] +=
++            ne * texture[channel_offset + iy_ne * texture_size + ix_ne];
++        result[c] +=
++            sw * texture[channel_offset + iy_sw * texture_size + ix_sw];
++        result[c] +=
++            se * texture[channel_offset + iy_se * texture_size + ix_se];
++    }
++}
++
++inline __device__ vec2 backward_bilinear_texture_sampler_unbounded(
++    float *perchannel_grads,
++    float u,
++    float v,
++    const float *__restrict__ input,
++    float *__restrict__ grad_input,
++    int texture_size,
++    int channels,
++    float texture_sigma = 1.0f
++) {
++    // Convert from norm_im_coords [-sigma, sigma] to pix_coords
++    float x =
++        (u + texture_sigma) / (2.0f * texture_sigma) * texture_size - 0.5f;
++    float y =
++        (v + texture_sigma) / (2.0f * texture_sigma) * texture_size - 0.5f;
++
++    // Apply border clamping (equivalent to padding_mode="border")
++    float x_clamped = fmaxf(0.0f, fminf(texture_size - 1.0f, x));
++    float y_clamped = fmaxf(0.0f, fminf(texture_size - 1.0f, y));
++
++    // Get base corner coordinates (matches forward implementation)
++    int ix_nw = static_cast<int>(::floor(x));
++    int iy_nw = static_cast<int>(::floor(y));
++    int ix_ne = ix_nw + 1;
++    int iy_ne = iy_nw;
++    int ix_sw = ix_nw;
++    int iy_sw = iy_nw + 1;
++    int ix_se = ix_nw + 1;
++    int iy_se = iy_nw + 1;
++
++    // Get fractional parts for bilinear interpolation
++    float fx = x_clamped - ix_nw;
++    float fy = y_clamped - iy_nw;
++
++    // Clamp corner coordinates for texture access
++    int ix_nw_clamp = max(0, min(texture_size - 1, ix_nw));
++    int iy_nw_clamp = max(0, min(texture_size - 1, iy_nw));
++    int ix_ne_clamp = max(0, min(texture_size - 1, ix_ne));
++    int iy_ne_clamp = max(0, min(texture_size - 1, iy_ne));
++    int ix_sw_clamp = max(0, min(texture_size - 1, ix_sw));
++    int iy_sw_clamp = max(0, min(texture_size - 1, iy_sw));
++    int ix_se_clamp = max(0, min(texture_size - 1, ix_se));
++    int iy_se_clamp = max(0, min(texture_size - 1, iy_se));
++
++    // Calculate bilinear weights
++    float nw = (1.0f - fx) * (1.0f - fy);
++    float ne = fx * (1.0f - fy);
++    float sw = (1.0f - fx) * fy;
++    float se = fx * fy;
++
++    // Calculate and accumulate gradients to input texture (atomicAdd)
++    int texture_area = texture_size * texture_size;
++    for (int c = 0; c < channels; ++c) {
++        int channel_offset = c * texture_area;
++        float g_out = perchannel_grads[c];
++
++        atomicAdd(
++            grad_input + channel_offset + iy_nw_clamp * texture_size +
++                ix_nw_clamp,
++            nw * g_out
++        );
++        atomicAdd(
++            grad_input + channel_offset + iy_ne_clamp * texture_size +
++                ix_ne_clamp,
++            ne * g_out
++        );
++        atomicAdd(
++            grad_input + channel_offset + iy_sw_clamp * texture_size +
++                ix_sw_clamp,
++            sw * g_out
++        );
++        atomicAdd(
++            grad_input + channel_offset + iy_se_clamp * texture_size +
++                ix_se_clamp,
++            se * g_out
++        );
++    }
++
++    // Calculate gradients w.r.t. u and v coordinates
++    float gix = 0.0f;
++    float giy = 0.0f;
++
++    for (int c = 0; c < channels; ++c) {
++        int channel_offset = c * texture_area;
++        float g_out = perchannel_grads[c];
++
++        // Get texture values at each corner
++        float nw_val =
++            input[channel_offset + iy_nw_clamp * texture_size + ix_nw_clamp];
++        gix -= nw_val * (iy_se - y) * g_out;
++        giy -= nw_val * (ix_se - x) * g_out;
++
++        float ne_val =
++            input[channel_offset + iy_ne_clamp * texture_size + ix_ne_clamp];
++        gix += ne_val * (iy_sw - y) * g_out;
++        giy -= ne_val * (x - ix_sw) * g_out;
++
++        float sw_val =
++            input[channel_offset + iy_sw_clamp * texture_size + ix_sw_clamp];
++        gix -= sw_val * (y - iy_ne) * g_out;
++        giy += sw_val * (ix_ne - x) * g_out;
++
++        float se_val =
++            input[channel_offset + iy_se_clamp * texture_size + ix_se_clamp];
++        gix += se_val * (y - iy_nw) * g_out;
++        giy += se_val * (x - ix_nw) * g_out;
++    }
++
++    // Calculate gradient multipliers for coordinate transformation
++    // If coordinate is clamped, gradient w.r.t. normalized coord is zero
++    // Otherwise: d/du[(u + texture_sigma) / (2 * texture_sigma) * texture_size
++    // - 0.5] = texture_size / (2 * texture_sigma)
++    bool x_clamped_flag = (x < 0.0f) || (x > texture_size - 1.0f);
++    bool y_clamped_flag = (y < 0.0f) || (y > texture_size - 1.0f);
++
++    float gix_mult =
++        x_clamped_flag ? 0.0f : texture_size / (2.0f * texture_sigma);
++    float giy_mult =
++        y_clamped_flag ? 0.0f : texture_size / (2.0f * texture_sigma);
++
++    // Final coordinate gradients
++    vec2 grad_grid;
++    grad_grid.x = gix_mult * gix;
++    grad_grid.y = giy_mult * giy;
++    return grad_grid;
++}
++
++// Check if 2D coordinates are within texture bounds
++inline __device__ bool in_bounds_2d(int h, int w, int H, int W) {
++    return h >= 0 && h < H && w >= 0 && w < W;
++}
++
++// Default  : texture_normalize = false, texture_crop = false
++// Normlized: texture_normalize = true , texture_crop = false
++// Cropped  : texture_normalize = false, texture_crop = true
++inline __device__ void bilinear_texture_sampler(
++    float *result,
++    float u,
++    float v,
++    const float *__restrict__ texture,
++    int texture_size,
++    int channels,
++    bool texture_normalize,
++    bool texture_crop
++) {
++    float x = ((u + 1) / 2) * (texture_size - 1);
++    float y = ((v + 1) / 2) * (texture_size - 1);
++    int ix_nw = static_cast<int>(::floor(x));
++    int iy_nw = static_cast<int>(::floor(y));
++
++    int ix_ne = ix_nw + 1;
++    int iy_ne = iy_nw;
++    int ix_sw = ix_nw;
++    int iy_sw = iy_nw + 1;
++    int ix_se = ix_nw + 1;
++    int iy_se = iy_nw + 1;
++
++    // get surfaces to each neighbor:
++    float nw = (ix_se - x) * (iy_se - y);
++    float ne = (x - ix_sw) * (iy_sw - y);
++    float sw = (ix_ne - x) * (y - iy_ne);
++    float se = (x - ix_nw) * (y - iy_nw);
++
++    // Shortcut for texture_crop
++    bool in_bounds_nw = in_bounds_2d(iy_nw, ix_nw, texture_size, texture_size);
++    bool in_bounds_ne = in_bounds_2d(iy_ne, ix_ne, texture_size, texture_size);
++    bool in_bounds_sw = in_bounds_2d(iy_sw, ix_sw, texture_size, texture_size);
++    bool in_bounds_se = in_bounds_2d(iy_se, ix_se, texture_size, texture_size);
++    bool all_in_bounds =
++        in_bounds_nw && in_bounds_ne && in_bounds_sw && in_bounds_se;
++    if (texture_crop && !all_in_bounds) {
++        for (int c = 0; c < channels; ++c) {
++            result[c] = 0;
++        }
++        return;
++    }
++
++    // Update weights for texture_normalize
++    if (texture_normalize) {
++        float weight_sum = 0.0f;
++        if (in_bounds_nw) {
++            weight_sum += nw;
++        }
++        if (in_bounds_ne) {
++            weight_sum += ne;
++        }
++        if (in_bounds_sw) {
++            weight_sum += sw;
++        }
++        if (in_bounds_se) {
++            weight_sum += se;
++        }
++        if (weight_sum > 0.0f) {
++            nw /= weight_sum;
++            ne /= weight_sum;
++            sw /= weight_sum;
++            se /= weight_sum;
++        }
++    }
++
++    // calculate bilinear weighted pixel value and set output pixel
++    int texture_area = texture_size * texture_size;
++    for (int c = 0; c < channels; ++c) {
++        result[c] = 0;
++        if (in_bounds_nw) {
++            result[c] +=
++                texture[c * texture_area + iy_nw * texture_size + ix_nw] * nw;
++        }
++        if (in_bounds_ne) {
++            result[c] +=
++                texture[c * texture_area + iy_ne * texture_size + ix_ne] * ne;
++        }
++        if (in_bounds_sw) {
++            result[c] +=
++                texture[c * texture_area + iy_sw * texture_size + ix_sw] * sw;
++        }
++        if (in_bounds_se) {
++            result[c] +=
++                texture[c * texture_area + iy_se * texture_size + ix_se] * se;
++        }
++    }
++}
++
++inline __device__ vec2 backward_bilinear_texture_sampler(
++    float *perchannel_grads,
++    float u,
++    float v,
++    const float *__restrict__ input,
++    float *__restrict__ grad_input,
++    int texture_size,
++    int channels,
++    bool texture_normalize,
++    bool texture_crop
++) {
++    float x = ((u + 1) / 2) * (texture_size - 1);
++    float y = ((v + 1) / 2) * (texture_size - 1);
++
++    int ix_nw = static_cast<int>(::floor(x));
++    int iy_nw = static_cast<int>(::floor(y));
++
++    int ix_ne = ix_nw + 1;
++    int iy_ne = iy_nw;
++    int ix_sw = ix_nw;
++    int iy_sw = iy_nw + 1;
++    int ix_se = ix_nw + 1;
++    int iy_se = iy_nw + 1;
++
++    // get surfaces to each neighbor:
++    float nw = (ix_se - x) * (iy_se - y);
++    float ne = (x - ix_sw) * (iy_sw - y);
++    float sw = (ix_ne - x) * (y - iy_ne);
++    float se = (x - ix_nw) * (y - iy_nw);
++
++    // Precompute in_bounds checks for each corner
++    bool in_bounds_nw = in_bounds_2d(iy_nw, ix_nw, texture_size, texture_size);
++    bool in_bounds_ne = in_bounds_2d(iy_ne, ix_ne, texture_size, texture_size);
++    bool in_bounds_sw = in_bounds_2d(iy_sw, ix_sw, texture_size, texture_size);
++    bool in_bounds_se = in_bounds_2d(iy_se, ix_se, texture_size, texture_size);
++    bool all_in_bounds =
++        in_bounds_nw && in_bounds_ne && in_bounds_sw && in_bounds_se;
++
++    // Shortcut for texture_crop
++    if (texture_crop && !all_in_bounds) {
++        vec2 grad_grid;
++        grad_grid.x = 0;
++        grad_grid.y = 0;
++        return grad_grid;
++    }
++
++    // For texture_normalize, we need to calculate weight normalization
++    float weight_sum = 0.0f;
++    if (texture_normalize) {
++        // Calculate the weight sum for in-bounds weights
++        if (in_bounds_nw) {
++            weight_sum += nw;
++        }
++        if (in_bounds_ne) {
++            weight_sum += ne;
++        }
++        if (in_bounds_sw) {
++            weight_sum += sw;
++        }
++        if (in_bounds_se) {
++            weight_sum += se;
++        }
++
++        if (weight_sum > 0.0f) {
++            // Normalize the weights for in-bounds pixels
++            if (in_bounds_nw) {
++                nw /= weight_sum;
++            } else {
++                nw = 0.0f;
++            }
++            if (in_bounds_ne) {
++                ne /= weight_sum;
++            } else {
++                ne = 0.0f;
++            }
++            if (in_bounds_sw) {
++                sw /= weight_sum;
++            } else {
++                sw = 0.0f;
++            }
++            if (in_bounds_se) {
++                se /= weight_sum;
++            } else {
++                se = 0.0f;
++            }
++        }
++    }
++
++    float gix = 0, giy = 0;
++    // calculate and set grad_input
++    int texture_area = texture_size * texture_size;
++    for (int c = 0; c < channels; ++c) {
++        int channel_offset = c * texture_area;
++        float g_out = perchannel_grads[c];
++
++        // Update grad_input using normalized weights
++        if (in_bounds_nw) {
++            atomicAdd(
++                grad_input + channel_offset + iy_nw * texture_size + ix_nw,
++                nw * g_out
++            );
++        }
++        if (in_bounds_ne) {
++            atomicAdd(
++                grad_input + channel_offset + iy_ne * texture_size + ix_ne,
++                ne * g_out
++            );
++        }
++        if (in_bounds_sw) {
++            atomicAdd(
++                grad_input + channel_offset + iy_sw * texture_size + ix_sw,
++                sw * g_out
++            );
++        }
++        if (in_bounds_se) {
++            atomicAdd(
++                grad_input + channel_offset + iy_se * texture_size + ix_se,
++                se * g_out
++            );
++        }
++
++        // For calculating gradients with respect to u and v
++        // When texture_normalize is true, we need to account for the
++        // normalization in the gradient calculation
++        if (texture_normalize && weight_sum > 0.0f) {
++            // Get the texture values at each corner
++            float nw_val = 0.0f;
++            float ne_val = 0.0f;
++            float sw_val = 0.0f;
++            float se_val = 0.0f;
++
++            if (in_bounds_nw) {
++                nw_val = input[channel_offset + iy_nw * texture_size + ix_nw];
++            }
++            if (in_bounds_ne) {
++                ne_val = input[channel_offset + iy_ne * texture_size + ix_ne];
++            }
++            if (in_bounds_sw) {
++                sw_val = input[channel_offset + iy_sw * texture_size + ix_sw];
++            }
++            if (in_bounds_se) {
++                se_val = input[channel_offset + iy_se * texture_size + ix_se];
++            }
++
++            // Calculate the normalized output value
++            float norm_output =
++                nw_val * nw + ne_val * ne + sw_val * sw + se_val * se;
++
++            // Calculate gradients with respect to normalized weights
++            // These derivatives account for the chain rule when weights are
++            // normalized
++            if (in_bounds_nw) {
++                float d_nw = (nw_val - norm_output) / weight_sum;
++                gix -= d_nw * (iy_se - y) * g_out;
++                giy -= d_nw * (ix_se - x) * g_out;
++            }
++
++            if (in_bounds_ne) {
++                float d_ne = (ne_val - norm_output) / weight_sum;
++                gix += d_ne * (iy_sw - y) * g_out;
++                giy -= d_ne * (x - ix_sw) * g_out;
++            }
++
++            if (in_bounds_sw) {
++                float d_sw = (sw_val - norm_output) / weight_sum;
++                gix -= d_sw * (y - iy_ne) * g_out;
++                giy += d_sw * (ix_ne - x) * g_out;
++            }
++
++            if (in_bounds_se) {
++                float d_se = (se_val - norm_output) / weight_sum;
++                gix += d_se * (y - iy_nw) * g_out;
++                giy += d_se * (x - ix_nw) * g_out;
++            }
++        } else {
++            // Regular gradient calculation without normalization
++            if (in_bounds_nw) {
++                float nw_val =
++                    input[channel_offset + iy_nw * texture_size + ix_nw];
++                gix -= nw_val * (iy_se - y) * g_out;
++                giy -= nw_val * (ix_se - x) * g_out;
++            }
++            if (in_bounds_ne) {
++                float ne_val =
++                    input[channel_offset + iy_ne * texture_size + ix_ne];
++                gix += ne_val * (iy_sw - y) * g_out;
++                giy -= ne_val * (x - ix_sw) * g_out;
++            }
++            if (in_bounds_sw) {
++                float sw_val =
++                    input[channel_offset + iy_sw * texture_size + ix_sw];
++                gix -= sw_val * (y - iy_ne) * g_out;
++                giy += sw_val * (ix_ne - x) * g_out;
++            }
++            if (in_bounds_se) {
++                float se_val =
++                    input[channel_offset + iy_se * texture_size + ix_se];
++                gix += se_val * (y - iy_nw) * g_out;
++                giy += se_val * (x - ix_nw) * g_out;
++            }
++        }
++    }
++    vec2 grad_grid;
++    grad_grid.x = gix * (texture_size - 1) / 2;
++    grad_grid.y = giy * (texture_size - 1) / 2;
++    return grad_grid;
++}
++
++} // namespace bbsplat
++} // namespace gsplat
+diff --git a/gsplat/cuda/include/Ops.h b/gsplat/cuda/include/Ops.h
+index d77e3d0..8d2e8e5 100644
+--- a/gsplat/cuda/include/Ops.h
++++ b/gsplat/cuda/include/Ops.h
+@@ -305,7 +305,8 @@ projection_2dgs_fused_fwd(
+     const float eps2d,
+     const float near_plane,
+     const float far_plane,
+-    const float radius_clip
++    const float radius_clip,
++    const float texture_scale_multiplier
+ );
+ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+ projection_2dgs_fused_bwd(
+@@ -347,7 +348,8 @@ projection_2dgs_packed_fwd(
+     const uint32_t image_height,
+     const float near_plane,
+     const float far_plane,
+-    const float radius_clip
++    const float radius_clip,
++    const float texture_scale_multiplier
+ );
+ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+ projection_2dgs_packed_bwd(
+@@ -395,7 +397,13 @@ rasterize_to_pixels_2dgs_fwd(
+     const uint32_t tile_size,
+     // intersections
+     const at::Tensor tile_offsets, // [C, tile_height, tile_width]
+-    const at::Tensor flatten_ids   // [n_isects]
++    const at::Tensor flatten_ids,  // [n_isects]
++    // texture parameters for BBSplat
++    const at::optional<at::Tensor> texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const at::optional<at::Tensor> texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size,      // texture_h (== texture_w)
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode  // texture alpha mode
+ );
+ std::tuple<
+     at::Tensor,
+@@ -404,7 +412,9 @@ std::tuple<
+     at::Tensor,
+     at::Tensor,
+     at::Tensor,
+-    at::Tensor>
++    at::Tensor,
++    at::optional<at::Tensor>,
++    at::optional<at::Tensor>>
+ rasterize_to_pixels_2dgs_bwd(
+     // Gaussian parameters
+     const at::Tensor means2d,        // [C, N, 2] or [nnz, 2]
+@@ -434,7 +444,13 @@ rasterize_to_pixels_2dgs_bwd(
+     const at::Tensor v_render_distort, // [C, image_height, image_width, 1]
+     const at::Tensor v_render_median,  // [C, image_height, image_width, 1]
+     // options
+-    bool absgrad
++    bool absgrad,
++    // texture parameters for BBSplat
++    const at::optional<at::Tensor> texture_colors, // [N, 3, texture_h, texture_w] or [nnz, 3, texture_h, texture_w]
++    const at::optional<at::Tensor> texture_alphas, // [N, texture_h, texture_w] or [nnz, texture_h, texture_w]
++    const uint32_t texture_size,      // texture_h (== texture_w)
++    const float texture_color_sigma,        // sigma parameter for unbounded texture sampling
++    const TextureAlphaMode texture_alpha_mode  // texture alpha mode
+ );
+ 
+ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_2dgs(
+diff --git a/gsplat/rendering.py b/gsplat/rendering.py
+index 48d18a8..eb1162e 100644
+--- a/gsplat/rendering.py
++++ b/gsplat/rendering.py
+@@ -9,6 +9,7 @@ from typing_extensions import Literal
+ 
+ from .cuda._wrapper import (
+     RollingShutterType,
++    TextureAlphaMode,
+     fully_fused_projection,
+     fully_fused_projection_2dgs,
+     fully_fused_projection_with_ut,
+@@ -1160,6 +1161,11 @@ def rasterization_2dgs(
+     absgrad: bool = False,
+     distloss: bool = False,
+     depth_mode: Literal["expected", "median"] = "expected",
++    texture_colors: Optional[Tensor] = None,
++    texture_alphas: Optional[Tensor] = None,
++    texture_color_sigma: float = 1.0,
++    texture_alpha_mode: TextureAlphaMode = TextureAlphaMode.TEXTURE,
++    texture_scale_multiplier: float = 1.0,
+ ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
+     """Rasterize a set of 2D Gaussians (N) to a batch of image planes (C).
+ 
+@@ -1207,6 +1213,17 @@ def rasterization_2dgs(
+             will be done looply in chunks.
+         distloss: If true, use distortion regularization to get better geometry detail.
+         depth_mode: render depth mode. Choose from expected depth and median depth.
++        texture_colors: Optional texture colors for BBSplat-style texture rendering.
++            If provided, should have shape [N, 3, texture_h, texture_w] where texture_h == texture_w.
++            Each Gaussian gets its own RGB texture map. Must be provided together with texture_alphas.
++        texture_alphas: Optional texture alphas for BBSplat-style texture rendering.
++            If provided, should have shape [N, texture_h, texture_w] where texture_h == texture_w.
++            Each Gaussian gets its own alpha texture map. Must be provided together with texture_colors.
++        texture_color_sigma: Sigma parameter for unbounded texture sampling.
++            Default: 1.0.
++        texture_alpha_mode: Alpha computation mode - TextureAlphaMode.TEXTURE:
++            use only texture alpha (default), TextureAlphaMode.GAUSSIAN: use only 2DGS alpha,
++            TextureAlphaMode.MULTIPLY: multiply both. Default: TextureAlphaMode.TEXTURE.
+ 
+     Returns:
+         A tuple:
+@@ -1292,21 +1309,92 @@ def rasterization_2dgs(
+         ), colors.shape
+         assert (sh_degree + 1) ** 2 <= colors.shape[1], colors.shape
+ 
++    # Validate texture parameters
++    texture_size = 0
++    if texture_colors is not None or texture_alphas is not None:
++        # Both must be provided together, unless texture_alpha_mode is GAUSSIAN
++        # where texture_alphas can be None even when texture_colors is provided
++        if texture_colors is None or (
++            texture_alphas is None and texture_alpha_mode != TextureAlphaMode.GAUSSIAN
++        ):
++            raise ValueError(
++                "texture_colors and texture_alphas must both be provided or both be None, "
++                "except when texture_alpha_mode=GAUSSIAN where texture_alphas can be None"
++            )
++        # Check texture_colors shape: (N, 3, texture_h, texture_w)
++        if (
++            texture_colors.dim() != 4
++            or texture_colors.shape[0] != N
++            or texture_colors.shape[1] != 3
++        ):
++            raise ValueError(
++                f"texture_colors must be (N, 3, texture_h, texture_w), got {texture_colors.shape}"
++            )
++        # Check texture_alphas shape: (N, texture_h, texture_w) - only if provided
++        if texture_alphas is not None:
++            if texture_alphas.dim() != 3 or texture_alphas.shape[0] != N:
++                raise ValueError(
++                    f"texture_alphas must be (N, texture_h, texture_w), got {texture_alphas.shape}"
++                )
++        # Ensure square textures and consistent sizes for texture_colors and texture_alphas
++        if texture_colors.shape[2] != texture_colors.shape[3]:
++            raise ValueError(
++                f"texture_colors must have square texture maps, got {texture_colors.shape}"
++            )
++        if texture_alphas is not None:
++            if texture_alphas.shape[1] != texture_alphas.shape[2]:
++                raise ValueError(
++                    f"texture_alphas must have square texture maps, got {texture_alphas.shape}"
++                )
++            if texture_colors.shape[2] != texture_alphas.shape[1]:
++                raise ValueError(
++                    f"texture_colors and texture_alphas must have same texture size, "
++                    f"got {texture_colors.shape} vs {texture_alphas.shape}"
++                )
++        texture_size = texture_colors.shape[2]
++
++        # Ensure same device and dtype
++        if texture_colors.device != means.device:
++            raise ValueError(
++                f"texture_colors must be on same device as means ({means.device}), "
++                f"got {texture_colors.device}"
++            )
++        if texture_alphas is not None and texture_alphas.device != means.device:
++            raise ValueError(
++                f"texture_alphas must be on same device as means ({means.device}), "
++                f"got {texture_alphas.device}"
++            )
++
++    # Check if textures are enabled - only based on texture_colors
++    texture_enabled = texture_colors is not None
++
++    # Validate texture alpha modes when textures are enabled
++    if texture_enabled:
++        if (
++            texture_alpha_mode in [TextureAlphaMode.TEXTURE, TextureAlphaMode.MULTIPLY]
++            and texture_alphas is None
++        ):
++            raise ValueError(
++                f"texture_alphas must be provided when "
++                f"texture_alpha_mode='{texture_alpha_mode.name.lower()}'"
++            )
++
+     # Compute Ray-Splat intersection transformation.
+     proj_results = fully_fused_projection_2dgs(
+-        means,
+-        quats,
+-        scales,
+-        viewmats,
+-        Ks,
+-        width,
+-        height,
+-        eps2d,
+-        near_plane,
+-        far_plane,
+-        radius_clip,
+-        packed,
+-        sparse_grad,
++        means=means,
++        quats=quats,
++        scales=scales,
++        viewmats=viewmats,
++        Ks=Ks,
++        width=width,
++        height=height,
++        eps2d=eps2d,
++        near_plane=near_plane,
++        far_plane=far_plane,
++        radius_clip=radius_clip,
++        packed=packed,
++        sparse_grad=sparse_grad,
++        texture_scale_multiplier=texture_scale_multiplier,
+     )
+ 
+     if packed:
+@@ -1403,6 +1491,11 @@ def rasterization_2dgs(
+         packed=packed,
+         absgrad=absgrad,
+         distloss=distloss,
++        texture_colors=texture_colors,
++        texture_alphas=texture_alphas,
++        texture_size=texture_size,
++        texture_color_sigma=texture_color_sigma,
++        texture_alpha_mode=texture_alpha_mode,
+     )
+     render_normals_from_depth = None
+     if render_mode in ["ED", "RGB+ED"]:
+@@ -1421,9 +1514,12 @@ def rasterization_2dgs(
+         elif depth_mode == "median":
+             depth_for_normal = render_median
+ 
++        # Depth shape [C, H, W, 3], where viewmats is [C, 4, 4], Ks is [C, 3, 3]
++        # render_normals_from_depth's shape must match render_normals's shape
++        # Thus, we don't need the squeeze(0) here
+         render_normals_from_depth = depth_to_normal(
+             depth_for_normal, torch.linalg.inv(viewmats), Ks
+-        ).squeeze(0)
++        )
+ 
+     meta = {
+         "camera_ids": camera_ids,
+diff --git a/setup.py b/setup.py
+index eb728ab..493a45b 100644
+--- a/setup.py
++++ b/setup.py
+@@ -5,6 +5,10 @@ import pathlib
+ import platform
+ import sys
+ 
++if platform.system().lower() != "linux":
++    # Skip build cuda extension on non-Linux platforms.
++    os.environ["BUILD_NO_CUDA"] = "1"
++
+ from setuptools import find_packages, setup
+ 
+ __version__ = None
+diff --git a/tests/test_2dgs.py b/tests/test_2dgs.py
+index d5b750b..cf0841b 100644
+--- a/tests/test_2dgs.py
++++ b/tests/test_2dgs.py
+@@ -374,9 +374,6 @@ def test_rasterize_to_pixels_2dgs(test_data):
+         "v_backgrounds": (v_backgrounds, _v_backgrounds),
+         "v_normals": (v_normals, _v_normals),
+     }
+-    for name, (v, _v) in pairs.items():
+-        diff = (v - _v).abs()
+-        print(f"{name=} {v.shape} {diff.max()=} {diff.mean()=}")
+ 
+     # assert close forward
+     torch.testing.assert_close(render_colors, _render_colors)
+diff --git a/tests/test_2dgs_bbsplat.py b/tests/test_2dgs_bbsplat.py
+new file mode 100644
+index 0000000..afcb840
+--- /dev/null
++++ b/tests/test_2dgs_bbsplat.py
+@@ -0,0 +1,607 @@
++import math
++from typing import Literal
++
++import pytest
++import torch
++
++from gsplat._helper import load_test_data
++import os
++import imageio
++from gsplat.cuda._wrapper import TextureAlphaMode
++
++device = torch.device("cuda:0")
++
++
++def check_allclose(
++    actual,
++    expected,
++    rtol=1e-4,
++    atol=1e-4,
++    pass_threshold=1.0,
++    name="tensors",
++):
++    """
++    Check if tensors are close and print detailed statistics.
++
++    Args:
++        actual: First tensor to compare
++        expected: Second tensor to compare
++        rtol: Relative tolerance
++        atol: Absolute tolerance
++        pass_threshold: Minimum fraction of values that must be within tolerance
++        name: Name for the comparison (for printing)
++    """
++    # Flatten tensors for easier computation
++    actual_flat = actual.flatten()
++    expected_flat = expected.flatten()
++
++    # Compute absolute and relative differences
++    abs_diff = torch.abs(actual_flat - expected_flat)
++    rel_diff = abs_diff / (torch.abs(expected_flat) + atol)
++
++    # Check which elements are within tolerance
++    within_threshold = (abs_diff <= atol) | (rel_diff <= rtol)
++
++    total_elements = len(actual_flat)
++    within_count = within_threshold.sum().item()
++    within_percentage = (within_count / total_elements) * 100
++
++    max_abs_diff = abs_diff.max().item()
++    max_rel_diff = rel_diff.max().item()
++    mean_abs_diff = abs_diff.float().mean().item()
++    mean_rel_diff = rel_diff.float().mean().item()
++
++    # Color coding: green if >98% match, red otherwise
++    if within_percentage > 98.0:
++        color_start = "\033[92m"  # Green
++        color_end = "\033[0m"  # Reset
++    else:
++        color_start = "\033[91m"  # Red
++        color_end = "\033[0m"  # Reset
++
++    print(
++        f"{color_start}{name}: {within_count} ({within_percentage:.1f}%) of {total_elements} within threshold{color_end}"
++    )
++    print(f"  Max abs diff: {max_abs_diff:.2e}, Mean abs diff: {mean_abs_diff:.2e}")
++    if within_percentage < 95.0:  # Warn if less than 95% are within threshold
++        print(f"  WARNING: Only {within_percentage:.1f}% of values within threshold!")
++
++    # Check if percentage meets the required fraction
++    required_percentage = pass_threshold * 100.0
++    if within_percentage < required_percentage:
++        raise AssertionError(
++            f"{name}: Only {within_percentage:.1f}% of values are within tolerance, "
++            f"but {required_percentage:.1f}% required. "
++            f"Max abs diff: {max_abs_diff:.2e}, Mean abs diff: {mean_abs_diff:.2e}"
++        )
++
++    return within_count == total_elements
++
++
++def generate_test_data_simple():
++    """Generate simple test data (original fixture data)."""
++    torch.manual_seed(42)
++
++    # Make the gaussians overlap and have different depths
++    N = 2
++    xs = torch.linspace(-0.1, 0.1, N, device=device)
++    ys = torch.linspace(-0.1, 0.1, N, device=device)
++    xys = torch.stack(torch.meshgrid(xs, ys, indexing="ij"), dim=-1).reshape(-1, 2)
++    zs = torch.linspace(2.0, 4.0, xys.shape[0], device=device).reshape(-1, 1)
++    means = torch.cat([xys, zs], dim=-1)
++    quats = torch.tensor([[1.0, 0.0, 0.0, 0]], device=device).repeat(len(means), 1)
++    scales = torch.ones_like(means)
++    scales[..., :2] *= 0.1
++    opacities = torch.ones(1, len(means), device=device) * 0.5
++    colors = torch.rand(1, len(means), 3, device=device)
++    viewmats = torch.eye(4, device=device).reshape(1, 4, 4)
++    # W, H = 24, 20
++    W, H = 80, 60
++    fx, fy, cx, cy = W, W, W // 2, H // 2
++    Ks = torch.tensor(
++        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], device=device
++    ).reshape(1, 3, 3)
++    return {
++        "means": means,
++        "quats": quats,
++        "scales": scales,
++        "opacities": opacities,
++        "colors": colors,
++        "viewmats": viewmats,
++        "Ks": Ks,
++        "width": W,
++        "height": H,
++    }
++
++
++def generate_test_data_random():
++    """Generate random test data for more comprehensive testing."""
++    torch.manual_seed(42)
++
++    # More gaussians with random positions
++    N = 8
++    means = torch.randn(N, 3, device=device)
++    means[:, 2] = torch.abs(means[:, 2]) + 1.0  # Ensure positive depth
++
++    # Random quaternions (normalized)
++    quats = torch.randn(N, 4, device=device)
++    quats = quats / torch.norm(quats, dim=-1, keepdim=True)
++
++    # Random scales
++    scales = torch.rand(N, 3, device=device) * 0.5 + 0.1  # Between 0.1 and 0.6
++
++    # Random opacities and colors
++    opacities = torch.rand(1, N, device=device)
++    colors = torch.rand(1, N, 3, device=device)
++
++    # Random viewmat (rotation + translation)
++    viewmat = torch.eye(4, device=device)
++    viewmat[:3, :3] = torch.eye(3) + 0.1 * torch.randn(
++        3, 3
++    )  # Small rotation perturbation
++    viewmat[:3, 3] = torch.randn(3) * 0.5  # Random translation
++    viewmats = viewmat.reshape(1, 4, 4)
++
++    # Random camera intrinsics
++    W, H = 80, 60
++    fx = W + torch.randn(1).item() * 10
++    fy = W + torch.randn(1).item() * 10
++    cx = W // 2 + torch.randn(1).item() * 5
++    cy = H // 2 + torch.randn(1).item() * 5
++    Ks = torch.tensor(
++        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], device=device
++    ).reshape(1, 3, 3)
++
++    return {
++        "means": means,
++        "quats": quats,
++        "scales": scales,
++        "opacities": opacities,
++        "colors": colors,
++        "viewmats": viewmats,
++        "Ks": Ks,
++        "width": W,
++        "height": H,
++    }
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
++def test_projection_2dgs_bbsplat():
++    from gsplat.cuda._torch_impl_2dgs import _fully_fused_projection_2dgs
++    from gsplat.cuda._wrapper import fully_fused_projection_2dgs
++
++    torch.manual_seed(42)
++
++    test_data = generate_test_data_simple()
++    Ks = test_data["Ks"]
++    viewmats = test_data["viewmats"]
++    height = test_data["height"]
++    width = test_data["width"]
++    quats = test_data["quats"]
++    scales = test_data["scales"]
++    means = test_data["means"]
++    viewmats.requires_grad = True
++    quats.requires_grad = True
++    scales.requires_grad = True
++    means.requires_grad = True
++
++    # Create texture data
++    texture_size = 4  # 4x4 texture
++    N = means.shape[0]
++    texture_colors = torch.rand(N, 3, texture_size, texture_size, device=device)
++    texture_alphas = torch.rand(N, texture_size, texture_size, device=device)
++
++    # Enable gradients for texture parameters
++    texture_colors.requires_grad = True
++    texture_alphas.requires_grad = True
++
++    # forward
++    _radii, _means2d, _depths, _ray_transforms, _normals = _fully_fused_projection_2dgs(
++        means=means,
++        quats=quats,
++        scales=scales,
++        viewmats=viewmats,
++        Ks=Ks,
++        width=width,
++        height=height,
++        texture_scale_multiplier=2.0,
++    )
++    _ray_transforms = _ray_transforms.permute(
++        (0, 1, 3, 2)
++    )  # TODO(WZ): Figure out why do we need to permute here
++
++    radii, means2d, depths, ray_transforms, normals = fully_fused_projection_2dgs(
++        means=means,
++        quats=quats,
++        scales=scales,
++        viewmats=viewmats,
++        Ks=Ks,
++        width=width,
++        height=height,
++        texture_scale_multiplier=2.0,
++    )
++
++    # TODO (WZ): is the following true for 2dgs as while?
++    # radii is integer so we allow for 1 unit difference
++    valid = ((radii > 0) & (_radii > 0)).all(dim=-1)
++    check_allclose(radii, _radii, rtol=0, atol=1, name="radii")
++    check_allclose(means2d[valid], _means2d[valid], name="means2d")
++    check_allclose(depths[valid], _depths[valid], name="depths")
++    check_allclose(ray_transforms[valid], _ray_transforms[valid], name="ray_transforms")
++    check_allclose(normals[valid], _normals[valid], name="normals")
++
++    # backward
++    v_means2d = torch.randn_like(means2d) * valid[..., None]
++    v_depths = torch.randn_like(depths) * valid
++    v_ray_transforms = torch.randn_like(ray_transforms) * valid[..., None, None]
++    v_normals = torch.randn_like(normals) * valid[..., None]
++
++    v_viewmats, v_quats, v_scales, v_means = torch.autograd.grad(
++        (means2d * v_means2d).sum()
++        + (depths * v_depths).sum()
++        + (ray_transforms * v_ray_transforms).sum()
++        + (normals * v_normals).sum(),
++        (viewmats, quats, scales, means),
++    )
++    _v_viewmats, _v_quats, _v_scales, _v_means = torch.autograd.grad(
++        (_means2d * v_means2d).sum()
++        + (_depths * v_depths).sum()
++        + (_ray_transforms * v_ray_transforms).sum()
++        + (_normals * v_normals).sum(),
++        (viewmats, quats, scales, means),
++    )
++
++    check_allclose(v_viewmats, _v_viewmats, name="v_viewmats")
++    check_allclose(v_quats, _v_quats, name="v_quats")
++    check_allclose(v_scales[..., :2], _v_scales[..., :2], name="v_scales")
++    check_allclose(v_means, _v_means, name="v_means")
++
++
++def _test_rasterize_textures_base(
++    texture_color_sigma=1.0,
++    texture_alpha_mode=None,
++    suffix="unspecified",
++    force_texture_alphas_none=False,
++    data_source: Literal["simple", "random"] = "simple",
++):
++    """Base test function for BBSplat texture functionality in 2DGS rasterization comparing CUDA and PyTorch implementations."""
++    from gsplat.cuda._torch_impl_2dgs import _rasterize_to_pixels_2dgs
++    from gsplat.cuda._wrapper import (
++        TextureAlphaMode,
++        fully_fused_projection_2dgs,
++        isect_offset_encode,
++        isect_tiles,
++        rasterize_to_pixels_2dgs,
++    )
++
++    # Set default texture_alpha_mode if not provided
++    if texture_alpha_mode is None:
++        texture_alpha_mode = TextureAlphaMode.TEXTURE
++
++    torch.manual_seed(42)
++
++    # Generate test data based on data_source
++    if data_source == "random":
++        current_test_data = generate_test_data_random()
++    else:  # simple
++        current_test_data = generate_test_data_simple()
++
++    Ks = current_test_data["Ks"]
++    viewmats = current_test_data["viewmats"]
++    height = current_test_data["height"]
++    width = current_test_data["width"]
++    quats = current_test_data["quats"]
++    scales = current_test_data["scales"]
++    means = current_test_data["means"]
++    colors = current_test_data["colors"]
++    opacities = current_test_data["opacities"]
++
++    N = means.shape[0]
++    C = viewmats.shape[0]
++
++    # Create texture data
++    texture_size = 4  # 4x4 texture
++    texture_colors = torch.rand(N, 3, texture_size, texture_size, device=device)
++    texture_alphas = torch.rand(N, texture_size, texture_size, device=device)
++
++    # Enable gradients for texture parameters
++    texture_colors.requires_grad = True
++    texture_alphas.requires_grad = True
++
++    # Handle texture_alphas based on mode and test parameters
++    if force_texture_alphas_none:
++        texture_alphas = None
++
++    radii, means2d, depths, ray_transforms, normals = fully_fused_projection_2dgs(
++        means, quats, scales, viewmats, Ks, width, height
++    )
++
++    colors = torch.concatenate((colors, depths.unsqueeze(-1)), dim=-1)
++    backgrounds = torch.zeros((C, colors.shape[-1]), device=device)
++
++    # Identify intersecting tiles
++    tile_size = 16
++    tile_width = math.ceil(width / float(tile_size))
++    tile_height = math.ceil(height / float(tile_size))
++    tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
++        means2d, radii, depths, tile_size, tile_width, tile_height
++    )
++    isect_offsets = isect_offset_encode(isect_ids, C, tile_width, tile_height)
++
++    colors = colors.repeat(C, 1, 1)
++    opacities = opacities.repeat(C, 1)
++    normals = normals.repeat(C, 1, 1)
++    densify = torch.zeros_like(means2d, device=means2d.device)
++
++    means2d.requires_grad = True
++    ray_transforms.requires_grad = True
++    colors.requires_grad = True
++    opacities.requires_grad = True
++    backgrounds.requires_grad = True
++    normals.requires_grad = True
++    densify.requires_grad = True
++
++    # Test CUDA implementation with textures and new features
++    (
++        render_colors,
++        render_alphas,
++        render_normals,
++        _,
++        render_median,
++    ) = rasterize_to_pixels_2dgs(
++        means2d,
++        ray_transforms,
++        colors,
++        opacities,
++        normals,
++        densify,
++        width,
++        height,
++        tile_size,
++        isect_offsets,
++        flatten_ids,
++        backgrounds=backgrounds,
++        distloss=True,
++        texture_colors=texture_colors,
++        texture_alphas=texture_alphas,
++        texture_size=texture_size,
++        texture_color_sigma=texture_color_sigma,
++        texture_alpha_mode=texture_alpha_mode,
++    )
++
++    # Test PyTorch implementation with textures and new features
++    _render_colors, _render_alphas, _render_normals = _rasterize_to_pixels_2dgs(
++        means2d,
++        ray_transforms,
++        colors,
++        normals,
++        opacities,
++        width,
++        height,
++        tile_size,
++        isect_offsets,
++        flatten_ids,
++        backgrounds=backgrounds,
++        texture_colors=texture_colors,
++        texture_alphas=texture_alphas,
++        texture_size=texture_size,
++        texture_color_sigma=texture_color_sigma,
++        texture_alpha_mode=texture_alpha_mode,
++    )
++
++    # Compare forward pass results
++    cuda_render = render_colors[0].detach().cpu()
++    torch_render = _render_colors[0].detach().cpu()
++    diff = (cuda_render - torch_render).abs()
++    os.makedirs("renders", exist_ok=True)
++    full_suffix = f"{suffix}_{data_source}"
++    imageio.imwrite(
++        f"renders/cuda_render_bbsplat_{full_suffix}.png", (255 * cuda_render).byte()
++    )
++    imageio.imwrite(
++        f"renders/torch_render_bbsplat_{full_suffix}.png", (255 * torch_render).byte()
++    )
++    imageio.imwrite(f"renders/diff_bbsplat_{full_suffix}.png", (255 * diff).byte())
++
++    # Test backward pass with textures
++    v_render_colors = torch.rand_like(render_colors)
++    v_render_alphas = torch.rand_like(render_alphas)
++    v_render_normals = torch.rand_like(render_normals)
++
++    # CUDA backward pass
++    cuda_inputs = [
++        means2d,
++        ray_transforms,
++        colors,
++        opacities,
++        backgrounds,
++        normals,
++        texture_colors,
++    ]
++    if texture_alphas is not None:
++        cuda_inputs.append(texture_alphas)
++
++    cuda_grads = torch.autograd.grad(
++        (render_colors * v_render_colors).sum()
++        + (render_alphas * v_render_alphas).sum()
++        + (render_normals * v_render_normals).sum(),
++        cuda_inputs,
++        allow_unused=True,
++    )
++
++    # Unpack gradients
++    if texture_alphas is not None:
++        (
++            v_means2d,
++            v_ray_transforms,
++            v_colors,
++            v_opacities,
++            v_backgrounds,
++            v_normals,
++            v_texture_colors,
++            v_texture_alphas,
++        ) = cuda_grads
++    else:
++        (
++            v_means2d,
++            v_ray_transforms,
++            v_colors,
++            v_opacities,
++            v_backgrounds,
++            v_normals,
++            v_texture_colors,
++        ) = cuda_grads
++        v_texture_alphas = None
++
++    # PyTorch backward pass
++    torch_inputs = [
++        ray_transforms,
++        colors,
++        backgrounds,
++        normals,
++        texture_colors,
++    ]
++    if texture_alphas is not None:
++        torch_inputs.append(texture_alphas)
++
++    torch_grads = torch.autograd.grad(
++        (_render_colors * v_render_colors).sum()
++        + (_render_alphas * v_render_alphas).sum()
++        + (_render_normals * v_render_normals).sum(),
++        torch_inputs,
++        allow_unused=True,
++    )
++
++    # Unpack gradients
++    if texture_alphas is not None:
++        (
++            _v_ray_transforms,
++            _v_colors,
++            _v_backgrounds,
++            _v_normals,
++            _v_texture_colors,
++            _v_texture_alphas,
++        ) = torch_grads
++    else:
++        (
++            _v_ray_transforms,
++            _v_colors,
++            _v_backgrounds,
++            _v_normals,
++            _v_texture_colors,
++        ) = torch_grads
++        _v_texture_alphas = None
++
++    # Check forward pass closeness - expect failures with new features
++    print(f"\n=== Forward Pass Comparison ({full_suffix}) ===")
++    check_allclose(render_colors, _render_colors, name="render_colors")
++    check_allclose(render_alphas, _render_alphas, name="render_alphas")
++    check_allclose(render_normals, _render_normals, name="render_normals")
++
++    # Check backward pass closeness - expect failures with new features
++    print(f"=== Backward Pass Comparison ({full_suffix}) ===")
++    check_allclose(v_ray_transforms, _v_ray_transforms, name="v_ray_transforms")
++    check_allclose(v_colors, _v_colors, name="v_colors")
++    check_allclose(v_backgrounds, _v_backgrounds, name="v_backgrounds")
++    check_allclose(v_normals, _v_normals, name="v_normals")
++    check_allclose(v_texture_colors, _v_texture_colors, name="v_texture_colors")
++
++    # Handle texture_alphas gradients - simple and clear logic
++    if texture_alphas is None:
++        # Case 1: texture_alphas was None -> None gradients
++        assert v_texture_alphas is None
++        assert _v_texture_alphas is None
++    elif texture_alpha_mode == TextureAlphaMode.GAUSSIAN:
++        # Case 2: GAUSSIAN mode, but texture_alphas is specifid -> zero gradients
++        zero_grads = torch.zeros_like(v_texture_alphas)
++        check_allclose(v_texture_alphas, zero_grads, name="v_texture_alphas")
++        check_allclose(_v_texture_alphas, zero_grads, name="_v_texture_alphas")
++    else:
++        # Case 3: Normal modes (TEXTURE, MULTIPLY) -> actual gradients
++        check_allclose(v_texture_alphas, _v_texture_alphas, name="v_texture_alphas")
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
++def test_rasterize_unbounded_alpha_mode_texture():
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.2,
++        texture_alpha_mode=TextureAlphaMode.TEXTURE,
++        suffix="unbounded_alpha_mode_texture",
++        data_source="simple",
++    )
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.2,
++        texture_alpha_mode=TextureAlphaMode.TEXTURE,
++        suffix="unbounded_alpha_mode_texture",
++        data_source="random",
++    )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
++def test_rasterize_unbounded_alpha_mode_gaussian():
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.4,
++        texture_alpha_mode=TextureAlphaMode.GAUSSIAN,
++        suffix="unbounded_alpha_mode_gaussian",
++        data_source="simple",
++    )
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.4,
++        texture_alpha_mode=TextureAlphaMode.GAUSSIAN,
++        suffix="unbounded_alpha_mode_gaussian",
++        data_source="random",
++    )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
++def test_rasterize_gaussian_mode_texture_alphas_none():
++    """Test GAUSSIAN mode with texture_alphas=None"""
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.0,
++        texture_alpha_mode=TextureAlphaMode.GAUSSIAN,
++        suffix="gaussian_mode_texture_alphas_none",
++        force_texture_alphas_none=True,
++        data_source="simple",
++    )
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.0,
++        texture_alpha_mode=TextureAlphaMode.GAUSSIAN,
++        suffix="gaussian_mode_texture_alphas_none",
++        force_texture_alphas_none=True,
++        data_source="random",
++    )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
++def test_rasterize_gaussian_mode_texture_alphas_tensor():
++    """Test GAUSSIAN mode with texture_alphas as tensor (should get zero gradients)"""
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.0,
++        texture_alpha_mode=TextureAlphaMode.GAUSSIAN,
++        suffix="gaussian_mode_texture_alphas_tensor",
++        force_texture_alphas_none=False,
++        data_source="simple",
++    )
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.0,
++        texture_alpha_mode=TextureAlphaMode.GAUSSIAN,
++        suffix="gaussian_mode_texture_alphas_tensor",
++        force_texture_alphas_none=False,
++        data_source="random",
++    )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA device")
++def test_rasterize_unbounded_alpha_mode_multiply():
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.6,
++        texture_alpha_mode=TextureAlphaMode.MULTIPLY,
++        suffix="unbounded_alpha_mode_multiply",
++        data_source="simple",
++    )
++    _test_rasterize_textures_base(
++        texture_color_sigma=1.6,
++        texture_alpha_mode=TextureAlphaMode.MULTIPLY,
++        suffix="unbounded_alpha_mode_multiply",
++        data_source="random",
++    )

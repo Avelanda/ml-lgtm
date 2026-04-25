@@ -1,0 +1,102 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lgtm"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    # PyTorch (no CUDA-specific index: PyPI default works for any GPU)
+    "torch>=2.5.0",
+    "torchvision",
+    "torchaudio",
+    "xformers",
+    # Training framework
+    "lightning",
+    "hydra-core",
+    "wandb",
+    # Core libraries
+    "numpy",
+    "setuptools",
+    "einops",
+    "jaxtyping",
+    "beartype",
+    "timm",
+    "lpips",
+    "dacite",
+    "Pillow",
+    "tqdm",
+    "colorama",
+    "rootutils",
+    "tabulate",
+    "imageio",
+    # Data processing and visualization
+    "scikit-image",
+    "scikit-video",
+    "opencv-python",
+    "matplotlib",
+    "moviepy",
+    "natsort",
+    # Dataset download tools
+    "yt-dlp",
+    "requests",
+    "huggingface-hub[cli]",
+    "pandas",
+    # Dev tools
+    "black",
+    "ruff",
+    "ipdb",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+# Enable Pyflakes `E` and `F` codes by default.
+select = ["E", "F", "I"]
+ignore = ["F722"] # Ignore F722 for jaxtyping compatibility.
+
+# Allow autofix for all enabled rules (when `--fix`) is provided.
+fixable = ["A", "B", "C", "D", "E", "F", "I"]
+unfixable = []
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "venv",
+]
+per-file-ignores = {}
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+# Same as Black.
+line-length = 80
+
+[tool.ruff.mccabe]
+# Unlike Flake8, default to a complexity level of 10.
+max-complexity = 10
+
+[tool.black]
+line-length = 80
+target-version = ["py310"]
+preview = true
+enable-unstable-feature = ["string_processing"]

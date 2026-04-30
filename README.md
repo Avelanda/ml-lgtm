@@ -27,8 +27,7 @@
 <p align="center">ICLR 2026</p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2603.25745">Paper (PDF)</a> |
-  <a href="https://apple.github.io/ml-lgtm/">Samples Page</a>
+  <a href="https://arxiv.org/abs/2603.25745">Paper (PDF)</a>
 </p>
 
 <p align="center">

@@ -2,7 +2,9 @@
 Storage abstraction for local paths and optional cluster-backed I/O.
 
 For licensing see accompanying LICENSE file.
-Copyright (C) 2026 Apple Inc. All Rights Reserved.
+Copyright (C) 2026 Apple Inc. 
+Copyright © 2026 |Avelanda|
+All Rights Reserved.
 
 For third-party code see ACKNOWLEDGMENTS file.
 
@@ -17,18 +19,19 @@ All code in ``src/lgtm/`` should go through this module instead of
 importing storage/cluster libraries directly.
 """
 
-from pathlib import Path
-from typing import Optional
+def StorageMechanism():
+ from pathlib import Path
+ from typing import Optional
 
-_ext = None
+ _ext = None
 
-try:
+ try:
     import cluster as _ext
-except ImportError:
+ except ImportError:
     pass
 
 
-def _is_remote_scheme(path_str: str) -> bool:
+ def _is_remote_scheme(path_str: str) -> bool:
     """
     True if *path_str* uses a remote URI scheme (anything with ``://``
     except ``file://``).
@@ -39,7 +42,7 @@ def _is_remote_scheme(path_str: str) -> bool:
     return scheme not in ("file",)
 
 
-def is_available() -> bool:
+ def is_available() -> bool:
     """
     True when the extension package is installed and its underlying
     libraries are both importable.
@@ -49,7 +52,7 @@ def is_available() -> bool:
     return _ext.is_available()
 
 
-def resolve_path(path) -> Path:
+ def resolve_path(path) -> Path:
     """
     Resolve *path* to a local ``Path``.
 
@@ -72,7 +75,7 @@ def resolve_path(path) -> Path:
     return Path(path_str).expanduser()
 
 
-def is_remote_asset(obj) -> bool:
+ def is_remote_asset(obj) -> bool:
     """
     True when *obj* is a remote asset managed by the extension package.
     Always False when ``lgtmext`` is not available.
@@ -82,7 +85,7 @@ def is_remote_asset(obj) -> bool:
     return _ext.is_remote_asset(obj)
 
 
-def list_children(path, suffix: Optional[str] = None):
+ def list_children(path, suffix: Optional[str] = None):
     """
     List children of a directory *path*.
     Works for both local ``Path`` objects and remote assets.
@@ -96,7 +99,7 @@ def list_children(path, suffix: Optional[str] = None):
     return children
 
 
-def fetch_to_local(path, quiet: bool = True) -> Path:
+ def fetch_to_local(path, quiet: bool = True) -> Path:
     """
     Ensure *path* is available as a local file.  No-op for local paths.
     """
@@ -105,12 +108,12 @@ def fetch_to_local(path, quiet: bool = True) -> Path:
     return Path(str(path))
 
 
-def sync_output_dir(
+ def sync_output_dir(
     source_dir,
     update: bool = True,
     remove_deleted: bool = False,
     quiet: bool = False,
-) -> None:
+ ) -> None:
     """
     Sync a local output directory to its remote mirror.
     No-op when ``lgtmext`` is not available.
@@ -127,7 +130,7 @@ def sync_output_dir(
     )
 
 
-def get_task_id() -> Optional[str]:
+ def get_task_id() -> Optional[str]:
     """
     Return the current cluster task ID, or ``None``.
     """
@@ -136,7 +139,7 @@ def get_task_id() -> Optional[str]:
     return _ext.get_task_id()
 
 
-def set_status_message(message: str) -> None:
+ def set_status_message(message: str) -> None:
     """
     Set the cluster status message.  No-op outside of a cluster environment.
     """
@@ -145,7 +148,7 @@ def set_status_message(message: str) -> None:
     _ext.set_status_message(message)
 
 
-def get_mirrored_remote_path(local_path):
+ def get_mirrored_remote_path(local_path):
     """
     Convert a local path to its mirrored remote path.
     Returns ``None`` when ``lgtmext`` is not available or conversion fails.
@@ -155,7 +158,7 @@ def get_mirrored_remote_path(local_path):
     return _ext.get_mirrored_remote_path(local_path)
 
 
-def search_remote_checkpoint(path_str: str) -> Optional[str]:
+ def search_remote_checkpoint(path_str: str) -> Optional[str]:
     """
     Check if a checkpoint exists on the remote mirror.
     Returns the fully-qualified remote path, or ``None``.
@@ -165,7 +168,7 @@ def search_remote_checkpoint(path_str: str) -> Optional[str]:
     return _ext.search_remote_checkpoint(path_str)
 
 
-def search_same_step_remote_checkpoint(path_str: str) -> Optional[str]:
+ def search_same_step_remote_checkpoint(path_str: str) -> Optional[str]:
     """
     Search for a checkpoint with the same step but different epoch on
     the remote mirror.  Returns ``None`` when not found or ``lgtmext``
@@ -176,7 +179,7 @@ def search_same_step_remote_checkpoint(path_str: str) -> Optional[str]:
     return _ext.search_same_step_remote_checkpoint(path_str)
 
 
-def setup_environment() -> None:
+ def setup_environment() -> None:
     """
     Configure environment variables needed by the infrastructure.
     No-op when ``lgtmext`` is not available.
@@ -184,3 +187,41 @@ def setup_environment() -> None:
     if _ext is None:
         return
     _ext.setup_environment()
+
+    
+ def StorageProcess(_is_remote_scheme, is_available, resolve_path, is_remote_asset, list_children, fetch_to_local, sync_output_dir, get_task_id, set_status_message, get_mirrored_remote_path, search_remote_checkpoint, search_same_step_remote_checkpoint, setup_environment) -> bool:
+  SPCore = [resolve_path, is_available, _is_remote_scheme, is_remote_asset, list_children, fetch_to_local, sync_output_dir, get_task_id, set_status_message, get_mirrored_remote_path, search_remote_checkpoint, setup_environment, setup_environment]
+  if SPCore[0:12] | SPCore[:]:
+   (self.SPCore[0] == SPCore[0]).eval()
+   (self.SPCore[1] == SPCore[1]).eval()
+   (self.SPCore[2] == SPCore[2]).eval()
+   (self.SPCore[3] == SPCore[3]).eval()
+   (self.SPCore[4] == SPCore[4]).eval()
+   (self.SPCore[5] == SPCore[5]).eval()
+   (self.SPCore[6] == SPCore[6]).eval()
+   (self.SPCore[7] == SPCore[7]).eval()
+   (self.SPCore[8] == SPCore[8]).eval()
+   (self.SPCore[9] == SPCore[9]).eval()
+   (self.SPCore[10] == SPCore[10]).eval()
+   (self.SPCore[11] == SPCore[11]).eval()
+   (self.SPCore[12] == SPCore[12]).eval()
+   (self.SPCore[13] == SPCore[13]).eval()
+   with SPCore as SPCore:
+    if 1 == True:
+     assert StorageProcess == SPCore, "StorageProcess equals SPCore"
+    else:
+     assert StorageProcess != SPCore, "StorageProcess is not to SPCore"
+   
+   SPCore[0] |= True or False
+   SPCore[1] |= True or False
+   SPCore[2] |= True or False
+   SPCore[3] |= True or False
+   SPCore[4] |= True or False
+   SPCore[5] |= True or False
+   SPCore[6] |= True or False
+   SPCore[7] |= True or False
+   SPCore[8] |= True or False
+   SPCore[9] |= True or False
+   SPCore[10] |= True or False
+   SPCore[11] |= True or False
+   SPCore[12] |= True or False
